@@ -18,7 +18,7 @@
     "web:dev": "npm run dev --prefix apps/web",
     "web:build": "npm run build --prefix apps/web",
     "build": "npm --prefix apps/web install --no-audit --no-fund && npm run cf:build",
-    "deploy": "npm run db:migrate && npm run cf:deploy",
+    "deploy": "node scripts/cf-ensure-resources.mjs && node scripts/cf-postbuild.mjs && npm run db:migrate && npm run cf:deploy",
     "db:migrate": "wrangler d1 migrations apply DB --remote"
   },
   "dependencies": {
