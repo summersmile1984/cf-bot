@@ -17,7 +17,7 @@
     "cf:dev": "npm run cf:build && node scripts/cf-dev-vars.mjs && wrangler dev -c .mastra/output/wrangler.json --local --var PROBE_ROUTES:1",
     "web:dev": "npm run dev --prefix apps/web",
     "web:build": "npm run build --prefix apps/web",
-    "build": "npm run cf:build",
+    "build": "npm --prefix apps/web install --no-audit --no-fund && npm run cf:build",
     "deploy": "npm run db:migrate && npm run cf:deploy",
     "db:migrate": "wrangler d1 migrations apply DB --remote"
   },
