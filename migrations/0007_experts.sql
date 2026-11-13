@@ -1,5 +1,10 @@
 -- 0007_experts.sql — L2 专家目录 + l2_tasks 专家管道（l2-experts spec S2.2/S2.3）
 -- L1 只有一个主 agent；专家定义在此表，执行位 = 用户 PC/云电脑（L2 Mastra Agent）
+-- 自包含（open-source-split 验证修复）：l2_tasks 基表由运行时 ensure 创建，全新库迁移须先建表
+CREATE TABLE IF NOT EXISTS l2_tasks (
+  task_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, resource_id TEXT, runtime TEXT, state TEXT NOT NULL,
+  result TEXT, reply TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, delivered INTEGER NOT NULL DEFAULT 0);
+
 CREATE TABLE IF NOT EXISTS agent_defs (
   id TEXT PRIMARY KEY,
   owner_user_id TEXT NOT NULL,

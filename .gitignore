@@ -21,3 +21,4 @@ dist/
 
 # 验证截图不入库（沿用 screenshots/ 约定），JSON/MD 证据保留
 shots/**/*.png
+.cf-root-config.json

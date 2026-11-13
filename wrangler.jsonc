@@ -1,5 +1,4 @@
 {
-  /* This file was auto-generated through Mastra. Edit the CloudflareDeployer() instance directly. */
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "mastra-l1",
   "compatibility_date": "2026-10-01",
@@ -30,5 +29,30 @@
     "module": "./.mastra/output/module-stub.mjs",
     "node:module": "./.mastra/output/module-stub.mjs",
     "@opentelemetry/api": "./.mastra/output/opentelemetry-api-stub.mjs"
+  },
+  "vectorize": [
+    {
+      "binding": "VECTORIZE",
+      "index_name": "om-memory"
+    },
+    {
+      "binding": "VECTORIZE_OBS",
+      "index_name": "om-memory-obs"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "OM_QUEUE",
+        "queue": "om-cycles"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "om-cycles",
+        "max_retries": 10,
+        "retry_delay": 30
+      }
+    ]
   }
 }

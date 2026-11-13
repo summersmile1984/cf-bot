@@ -61,9 +61,21 @@ w.vars = { ...(w.vars ?? {}), CLOUDFLARE_ACCOUNT_ID: '' };
 w.vars.VAULT_STORE_ID = '';
 // 根 wrangler.jsonc 优先（open-source-split S2.3）：Deploy to Cloudflare 按钮把资源 ID/vars 回写到根配置，
 // 这里同步进产物配置——一键部署与手动改配置都走同一条缝，硬编码值仅作兜底。
+
+w.vectorize = [
+  { binding: 'VECTORIZE', index_name: 'om-memory' },
+  { binding: 'VECTORIZE_OBS', index_name: 'om-memory-obs' },
+];
+// OM 周期走队列（S2.8）：请求侧只入队，consumer 独立 invocation 跑 Observer/Reflector
+w.queues = {
+  producers: [{ queue: 'om-cycles', binding: 'OM_QUEUE' }],
+  consumers: [{ queue: 'om-cycles', max_retries: 10, retry_delay: 30 }],
+};
+// 定时任务（schedules-secrets S2.1）：每分钟 tick
+w.triggers = { crons: ['* * * * *'] };
 try {
-  const raw = readFileSync('wrangler.jsonc', 'utf8');
-  const root = JSON.parse(raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, ''));
+  const raw = readFileSync(existsSync('.cf-root-config.json') ? '.cf-root-config.json' : 'wrangler.jsonc', 'utf8');
+  const root = JSON.parse(raw.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').map((l) => /^\s*\/\//.test(l) ? '' : l).join('\n'));
   // Deploy to Cloudflare 按钮把用户自定义的 Worker 名/资源名/资源 ID 回写根配置——全部同步进产物
   if (root?.name) w.name = root.name;
   const d1 = (root?.d1_databases ?? []).find((x) => x && x.database_id);
@@ -93,16 +105,13 @@ try {
     if (root?.vars?.[k]) w.vars[k] = root.vars[k];
   }
 } catch { /* 无根配置或解析失败：用兜底值 */ }
-w.vectorize = [
-  { binding: 'VECTORIZE', index_name: 'om-memory' },
-  { binding: 'VECTORIZE_OBS', index_name: 'om-memory-obs' },
-];
-// OM 周期走队列（S2.8）：请求侧只入队，consumer 独立 invocation 跑 Observer/Reflector
-w.queues = {
-  producers: [{ queue: 'om-cycles', binding: 'OM_QUEUE' }],
-  consumers: [{ queue: 'om-cycles', max_retries: 10, retry_delay: 30 }],
-};
-// 定时任务（schedules-secrets S2.1）：每分钟 tick
-w.triggers = { crons: ['* * * * *'] };
 writeFileSync(f, JSON.stringify(w, null, 2));
 console.log('[cf-postbuild] assets -> ./static, main -> ./worker-entry.mjs, DO ROOM_DO, AI + VECTORIZE + queues(om-cycles)');
+// 根配置还原（open-source-split S2.3）：mastra build 重写了根 wrangler.jsonc——把按钮/用户写回的
+// 快照还原回去，后续步骤（d1 migrations apply 等）与人工查看才读到正确值。
+try {
+  if (existsSync('.cf-root-config.json')) {
+    copyFileSync('.cf-root-config.json', 'wrangler.jsonc');
+    console.log('[cf-postbuild] root wrangler.jsonc restored from snapshot');
+  }
+} catch {}
