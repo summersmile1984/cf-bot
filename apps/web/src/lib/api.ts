@@ -363,3 +363,25 @@ export async function exportOmDownload(format: 'json' | 'md'): Promise<void> {
   a.click();
   URL.revokeObjectURL(a.href);
 }
+
+// ---------- 首跑引导（onboarding） ----------
+export type OnboardingStatus = {
+  needsSetup: boolean;
+  signupsOpen: boolean;
+  checks: { deepseekKey: boolean; l1PublicUrl: string; detectedOrigin: string; productName: string };
+};
+
+export async function getOnboardingStatus(): Promise<OnboardingStatus> {
+  const r = await fetch('/onboarding/status', { credentials: 'same-origin' });
+  return j(r);
+}
+
+export async function completeSetup(input: { name?: string; email: string; password: string }): Promise<{ ok: boolean; reason?: string }> {
+  const r = await fetch('/onboarding/setup', { ...jsonInit('POST', input), credentials: 'same-origin' });
+  return j(r);
+}
+
+export async function setRegistration(open: boolean): Promise<{ ok: boolean; reason?: string }> {
+  const r = await fetch('/settings/registration', { ...jsonInit('PUT', { open }), credentials: 'same-origin' });
+  return j(r);
+}

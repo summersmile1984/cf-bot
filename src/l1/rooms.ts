@@ -11,6 +11,7 @@ import { getPersona } from '../mastra/persona';
 import { ensureTopicCols, getRoomRow, resourceFor, topicCatalogText, createTopicRoom, setSticky } from './topics';
 import { routeMessage } from './routing';
 import { chargeQuota } from '../mastra/quota';
+import { isSignUpOpen } from '../mastra/onboarding';
 
 export type RoomEnv = AuthEnv & { DB: any };
 
@@ -401,13 +402,20 @@ export function roomHandlers(deps: RoomDeps) {
     { path: '/rooms/:id/messages', method: 'GET' as const, requiresAuth: false, handler: wrap((c) => listMessages(c, E)) },
     { path: '/rooms/:id/messages', method: 'POST' as const, requiresAuth: false, handler: wrap((c) => sendMessage(c, E, chat, notifyRoom, memory)) },
     { path: '/rooms/:id/ws', method: 'GET' as const, requiresAuth: false, handler: wrap((c) => upgradeWs(c, E)) },
-    // better-auth catch-all
+    // better-auth catch-all（sign-up 走注册闸门：首跑开放，管理员建好后默认关闭）
     {
       path: '/auth/*',
       method: 'ALL' as const,
       requiresAuth: false,
       handler: async (c: any) => {
         const req: Request = c.req.raw ?? c.req;
+        try {
+          const url = new URL(req.url);
+          if (req.method === 'POST' && url.pathname.includes('/sign-up')) {
+            const open = await isSignUpOpen(E.DB);
+            if (!open) return new Response(JSON.stringify({ error: 'registration_closed', message: '本部署已关闭注册，请联系管理员邀请' }), { status: 403, headers: { 'content-type': 'application/json' } });
+          }
+        } catch {}
         return getAuth(E).handler(req);
       },
     },

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { Persona } from '../lib/api';
-import { getModels, getPersona, updatePersona } from '../lib/api';
+import { getModels, getPersona, updatePersona, getOnboardingStatus, setRegistration } from '../lib/api';
 
 export function SettingsPanel({
   onClose,
@@ -25,6 +25,7 @@ export function SettingsPanel({
   const [modelEffort, setModelEffort] = useState('');
   const [gateways, setGateways] = useState<{ gateway: string; models: string[] }[]>([]);
   const [effortLevels, setEffortLevels] = useState<string[]>([]);
+  const [signupsOpen, setSignupsOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
@@ -51,6 +52,7 @@ export function SettingsPanel({
       })
       .catch(() => setErr('加载配置失败，请稍后重试'))
       .finally(() => setLoading(false));
+    getOnboardingStatus().then((s) => setSignupsOpen(s.signupsOpen)).catch(() => {});
   }, []);
 
   async function submit(e: React.FormEvent) {
@@ -259,6 +261,25 @@ export function SettingsPanel({
                 onChange={(e) => setToolDispatch(e.target.value)}
                 placeholder="任务派发工具描述"
                 className="w-full resize-none rounded-xl border border-[var(--color-line)] bg-[var(--color-bg)] px-3 py-2 outline-none focus:border-[var(--color-acc)]"
+              />
+            </label>
+
+            <div className="mb-4 mt-6 border-t border-[var(--color-line)] pt-4">
+              <p className="text-sm font-semibold">注册设置</p>
+              <p className="text-xs text-[var(--color-mut)]">是否允许新用户自行注册（管理员可随时切换）</p>
+            </div>
+            <label className="mb-5 flex items-center justify-between rounded-xl border border-[var(--color-line)] px-3 py-2.5">
+              <span className="text-sm">开放注册</span>
+              <input
+                type="checkbox"
+                checked={signupsOpen}
+                onChange={async (e) => {
+                  const v = e.target.checked;
+                  setSignupsOpen(v);
+                  const r = await setRegistration(v);
+                  if (!r.ok) setSignupsOpen(!v);
+                }}
+                className="h-4 w-4"
               />
             </label>
 

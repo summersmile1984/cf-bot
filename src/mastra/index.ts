@@ -37,6 +37,7 @@ import { pollL2Task } from '../l1/poll-l2';
 import { roomHandlers } from '../l1/rooms';
 import { createTopicRoom, archiveTopic, getRoomRow, resourceFor } from '../l1/topics';
 import { publishPage, getPage, unpublishPage } from '../l1/pages';
+import { getOnboardingStatus, completeSetup, setSignupsOpen } from './onboarding';
 import { chargeQuota, refundQuota, getQuota, applySubscription, addCredit, addCloudMinutes, TASK_POINTS, PUBLISH_POINTS, CLOUD_TASK_MINUTES } from './quota';
 import { ensureBillingTables, verifyPaddleSignature, handlePaddleEvent, createCheckout, getSubscription } from './billing';
 import { probeRoutes } from './probe-routes';
@@ -852,6 +853,51 @@ export const mastra = new Mastra({
           await ready;
           const p = await getPersona(d);
           return c.json({ productName: p.product_name });
+        },
+      } as any),
+      // 首跑引导（onboarding）：状态检测 / 建管 / 注册开关
+      registerApiRoute('/onboarding/status', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const { d, ready } = db();
+          await ready;
+          return c.json(await getOnboardingStatus(d, E as any, c.req.raw?.url ?? 'http://localhost/'));
+        },
+      } as any),
+      registerApiRoute('/onboarding/setup', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const body: any = await c.req.json().catch(() => ({}));
+          const { d, ready } = db();
+          await ready;
+          const r = await completeSetup(d, E as any, { name: String(body?.name ?? ''), email: String(body?.email ?? ''), password: String(body?.password ?? '') });
+          return c.json(r, r.ok ? 200 : 400);
+        },
+      } as any),
+      registerApiRoute('/settings/registration', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db();
+          await ready;
+          const st = await getOnboardingStatus(d, E as any, c.req.raw?.url ?? 'http://localhost/');
+          return c.json({ signupsOpen: st.signupsOpen });
+        },
+      } as any),
+      registerApiRoute('/settings/registration', {
+        method: 'PUT',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const { d, ready } = db();
+          await ready;
+          return c.json(await setSignupsOpen(d, u.id, !!body?.open));
         },
       } as any),
       // OM 记忆检视（S2.5）：自己的画像、所在房间的观测日志、全量导出

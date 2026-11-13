@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { Member, Persona, Room, User } from './lib/api';
-import { getSession, signOut, listRooms, createRoom, getRoom, getBrand } from './lib/api';
+import { getSession, signOut, listRooms, createRoom, getRoom, getBrand, getOnboardingStatus } from './lib/api';
 import { Login } from './components/Login';
+import { Setup } from './components/Setup';
 import { Sidebar } from './components/Sidebar';
 import { Chat } from './components/Chat';
 import { SettingsPanel } from './components/SettingsPanel';
@@ -20,12 +21,19 @@ export function App() {
   const [mcpTab, setMcpTab] = useState<'market' | 'mine'>('market');
   const [mcpToast, setMcpToast] = useState<string | null>(null);
   const [productName, setProductName] = useState('cf-bot');
+  const [onboarding, setOnboarding] = useState<'checking' | 'setup' | 'ready'>('checking');
 
   // 产品名（白牌化）：公开接口拉取，标题/登录页统一使用
   useEffect(() => {
     getBrand()
       .then((b) => setProductName(b.productName))
       .catch(() => {});
+  }, []);
+  // 首跑向导（onboarding）：无用户时强制进 /setup
+  useEffect(() => {
+    getOnboardingStatus()
+      .then((s) => setOnboarding(s.needsSetup ? 'setup' : 'ready'))
+      .catch(() => setOnboarding('ready'));
   }, []);
   useEffect(() => {
     document.title = `${productName} · 房间`;
@@ -113,10 +121,14 @@ export function App() {
     setSettingsOpen(false);
   }
 
-  if (loading) {
+  if (loading || onboarding === 'checking') {
     return (
       <div className="flex h-full items-center justify-center text-[var(--color-mut)]">加载中…</div>
     );
+  }
+
+  if (onboarding === 'setup') {
+    return <Setup productName={productName} onDone={() => setOnboarding('ready')} />;
   }
 
   if (!me) {
