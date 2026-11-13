@@ -1,0 +1,23 @@
+.env
+.env.*
+!.env.example
+node_modules/
+data/
+data-*/
+workspace-l2/
+*.log
+push-token
+*.db
+*.db-*
+*.pem
+*.key
+.dev.vars
+.wrangler/
+dist/
+.DS_Store
+/screenshots/*
+!/screenshots/.gitkeep
+.mastra/
+
+# 验证截图不入库（沿用 screenshots/ 约定），JSON/MD 证据保留
+shots/**/*.png

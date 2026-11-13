@@ -1,0 +1,220 @@
+{
+  "harnesses": [
+    {
+      "id": "dsh",
+      "name": "DeepSeek Harness",
+      "vendor": "DeepSeek",
+      "acp": "native",
+      "command": "dsh",
+      "args": [
+        "--profile",
+        "acp"
+      ],
+      "versionArgs": [
+        "--version"
+      ],
+      "homepage": "https://deepseek.com",
+      "note": "现状默认执行 harness"
+    },
+    {
+      "id": "codebuddy",
+      "name": "WorkBuddy / CodeBuddy Code",
+      "vendor": "Tencent",
+      "acp": "native",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@tencent-ai/codebuddy-code@latest",
+        "--acp"
+      ],
+      "versionArgs": [
+        "--version"
+      ],
+      "zeroInstall": true,
+      "install": {
+        "type": "npx",
+        "cmd": "npx -y @tencent-ai/codebuddy-code@latest --version",
+        "note": "npx 零安装；首次需在 REPL 里 /login（App 登录不通用）"
+      },
+      "homepage": "https://www.workbuddy.ai",
+      "note": "官方 npx 包（Zed registry 同款）；App 捆绑 shim 缺 dist 不可用、lite-wb 变体 ACP 不回话",
+      "detectBins": [
+        "codebuddy"
+      ]
+    },
+    {
+      "id": "mimo",
+      "name": "Xiaomi MiMo Code",
+      "vendor": "Xiaomi",
+      "acp": "native",
+      "command": "mimo",
+      "args": [
+        "acp"
+      ],
+      "versionArgs": [
+        "--version"
+      ],
+      "install": {
+        "type": "manual",
+        "cmd": "",
+        "note": "mimo.xiaomi.com 安装（MiMo Code CLI）"
+      },
+      "homepage": "https://mimo.xiaomi.com"
+    },
+    {
+      "id": "claude-code",
+      "name": "Claude Code (ACP adapter)",
+      "vendor": "Anthropic",
+      "acp": "adapter",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@agentclientprotocol/claude-agent-acp"
+      ],
+      "detectBins": [
+        "claude"
+      ],
+      "requires": [
+        "claude"
+      ],
+      "zeroInstall": true,
+      "versionArgs": [
+        "--version"
+      ],
+      "install": {
+        "type": "npx",
+        "cmd": "npx -y @agentclientprotocol/claude-agent-acp --help",
+        "note": "适配器 npx 零安装即用；本体 claude 可 brew/npm 装"
+      },
+      "homepage": "https://claude.com/claude-code"
+    },
+    {
+      "id": "codex",
+      "name": "Codex CLI (ACP adapter)",
+      "vendor": "OpenAI",
+      "acp": "adapter",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@agentclientprotocol/codex-acp"
+      ],
+      "detectBins": [
+        "codex"
+      ],
+      "requires": [
+        "codex"
+      ],
+      "zeroInstall": true,
+      "versionArgs": [
+        "--version"
+      ],
+      "install": {
+        "type": "npx",
+        "cmd": "npx -y @agentclientprotocol/codex-acp --help",
+        "note": "适配器 npx 零安装即用；本体 codex 可 npm i -g"
+      },
+      "homepage": "https://github.com/openai/codex"
+    },
+    {
+      "id": "gemini",
+      "name": "Gemini CLI",
+      "vendor": "Google",
+      "acp": "native",
+      "command": "gemini",
+      "args": [
+        "--acp"
+      ],
+      "versionArgs": [
+        "--version"
+      ],
+      "install": {
+        "type": "npx",
+        "cmd": "npm i -g @google/gemini-cli",
+        "note": "npm 全局安装"
+      },
+      "homepage": "https://github.com/google-gemini/gemini-cli"
+    },
+    {
+      "id": "opencode",
+      "name": "OpenCode",
+      "vendor": "OpenCode",
+      "acp": "native",
+      "command": "opencode",
+      "args": [
+        "acp"
+      ],
+      "versionArgs": [
+        "--version"
+      ],
+      "install": {
+        "type": "npx",
+        "cmd": "npm i -g opencode-ai",
+        "note": "npm 全局安装"
+      },
+      "homepage": "https://opencode.ai"
+    },
+    {
+      "id": "cline",
+      "name": "Cline",
+      "vendor": "Cline",
+      "acp": "native",
+      "command": "cline",
+      "args": [
+        "--acp"
+      ],
+      "versionArgs": [
+        "--version"
+      ],
+      "install": {
+        "type": "npx",
+        "cmd": "npm i -g cline",
+        "note": "npm 全局安装"
+      },
+      "homepage": "https://cline.bot"
+    },
+    {
+      "id": "cursor-agent",
+      "name": "Cursor Agent CLI",
+      "vendor": "Cursor",
+      "acp": "native",
+      "command": "cursor-agent",
+      "args": [
+        "acp"
+      ],
+      "versionArgs": [
+        "--version"
+      ],
+      "install": {
+        "type": "manual",
+        "cmd": "",
+        "note": "cursor.com 安装"
+      },
+      "homepage": "https://cursor.com"
+    },
+    {
+      "id": "copilot",
+      "name": "GitHub Copilot CLI",
+      "vendor": "GitHub",
+      "acp": "native",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@github/copilot",
+        "--acp"
+      ],
+      "detectBins": [
+        "copilot"
+      ],
+      "zeroInstall": true,
+      "versionArgs": [
+        "--version"
+      ],
+      "install": {
+        "type": "npx",
+        "cmd": "npx -y @github/copilot --version",
+        "note": "npx 零安装即用"
+      },
+      "homepage": "https://github.com/features/copilot"
+    }
+  ]
+}

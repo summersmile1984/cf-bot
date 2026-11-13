@@ -1,0 +1,10 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+.DS_Store
+.env
+*.log
+
+# cua sidecar（构建时获取，~200MB，不进 git）
+src-tauri/bin/cua-*

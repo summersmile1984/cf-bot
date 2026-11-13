@@ -1,0 +1,6 @@
+# 本文件供 Deploy to Cloudflare 按钮 / 本地开发提示 secrets 用（dotenv 格式）。
+# 复制为 .dev.vars（本地）或在部署向导里填入对应 secret；真实值不要提交。
+# 必填：DeepSeek API Key（https://platform.deepseek.com）
+DEEPSEEK_API_KEY=sk-xxxxxxxx
+# 可选：Vault 动态密钥的 CF API Token（不配则 vault 功能不可用；任务密钥仍走环境注入）
+# CLOUDFLARE_API_KEY=

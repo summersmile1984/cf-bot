@@ -1,0 +1,2135 @@
+/**
+ * L1 on Cloudflare Workers：官方 CloudflareDeployer + D1。
+ * 仅用于 `mastra build`；本地 Node 版仍走 src/server.ts（AgentController + sendSignal）。
+ *
+ * P3（主路径 = L2 出站 PULL；本机出口劫持 argotunnel DNS，cloudflared 不可用）：
+ *   dispatch_to_sandbox 本地生成 task_id（t-<uuid>），D1 l2_tasks 写入 state=queued + prompt，立即 ok:true
+ *     （只需 PUSH_TOKEN + thread；不要求 L2_A2A_URL 可达）
+ *   本机 L2（src/l2-pull-worker.ts）轮询 POST /l2-claim（Bearer/X-A2A-Notification-Token = PUSH_TOKEN）
+ *     → 原子 queued→working，返回 {taskId,prompt,runtime,threadId,kind,expertId,instructions,resourceId,model}（无任务 {task:null}）
+ *     → expert 走 runExpertAgent（Mastra Agent+本地记忆），sandbox 走 runAcpPrompt（dsh --profile acp）→ POST /a2a-callback（A2A Task 形状）→ 下面原有 compose + /l2-results 不变
+ *   若配置了 L2_A2A_URL：额外 best-effort A2A push（成功则改用 L2 的 task id；失败仅记日志，留给 pull）
+ *
+ * P2（Worker 侧派发 + 回调，现为可选 push 路径）：
+ *   orchestrator 工具 dispatch_to_sandbox → HTTP POST ${L2_A2A_URL}/api/a2a/l2-worker
+ *     A2A message/send { configuration:{ blocking:false, pushNotificationConfig:{ url: <L1>/a2a-callback, token: PUSH_TOKEN } } }
+ *   → D1 表 l2_tasks 登记 taskId → thread/resource（不用 in-memory Map：Worker isolate 随时被回收/多实例）
+ *   → L2（本机 src/l2-server.ts，Mastra Agent + @mastra/acp → dsh --profile acp）完成后 push
+ *   → POST /a2a-callback（注意：registerApiRoute 自定义路由**不带 /api 前缀**，与 /health-l1 一致）
+ *     校验 X-A2A-Notification-Token（timing-safe）→ D1 写 result
+ *     → ctx.waitUntil(orchestrator.generate(<sandbox-result>…, memory=同 thread)) 生成对用户的汇报，写入 D1.reply 并进 thread 记忆
+ *   → 前端轮询 GET /l2-results?thread=sid 拿到 reply 后作为 L1 消息显示。
+ * 为什么不是 sendSignal：Workers 上没有常驻 AgentController session；用 waitUntil + generate（单次请求内完成，
+ * 受 Worker CPU/墙钟限制，DeepSeek 一次调用通常 <30s）+ D1 落盘，是 Workers 上能稳定跑的方案。
+ * 即使 generate 失败，原始 result 仍在 D1，前端会退化显示原始结果。
+ */
+import { env, waitUntil } from 'cloudflare:workers';
+import { timingSafeEqual } from 'node:crypto';
+import { Mastra } from '@mastra/core';
+import { Agent } from '@mastra/core/agent';
+import { createTool } from '@mastra/core/tools';
+import { registerApiRoute } from '@mastra/core/server';
+import { CloudflareDeployer } from '@mastra/deployer-cloudflare';
+import { D1Store } from '@mastra/cloudflare-d1';
+import { Memory, Extractor } from '@mastra/memory';
+import { z } from 'zod';
+import { pollL2Task } from '../l1/poll-l2';
+import { roomHandlers } from '../l1/rooms';
+import { createTopicRoom, archiveTopic, getRoomRow, resourceFor } from '../l1/topics';
+import { publishPage, getPage, unpublishPage } from '../l1/pages';
+import { chargeQuota, refundQuota, getQuota, applySubscription, addCredit, addCloudMinutes, TASK_POINTS, PUBLISH_POINTS, CLOUD_TASK_MINUTES } from './quota';
+import { ensureBillingTables, verifyPaddleSignature, handlePaddleEvent, createCheckout, getSubscription } from './billing';
+import { probeRoutes } from './probe-routes';
+import { buildMastraAuth, getSessionUser } from '../auth';
+import { ensureOmTable, installD1OmSupport } from './om-d1';
+import { VectorizeStore } from './vectorize-store';
+import { createWorkersAiEmbedder } from './workers-ai-embedder';
+import { ensureProfileTable, upsertProfile, resolveUserByName, loadRoomProfileBlock } from './profile';
+import { ensurePersonaConfig, getPersona, updatePersona, personaBlock, buildThreadBlock, buildModelId, SEED_MODEL_ID } from './persona';
+import { indexThreadMessages } from './index-messages';
+import { ensureVaultTable, createVaultEntry, createOAuthCredential, listVaultEntries, deleteVaultEntry, getVaultEntry, getVaultValue, getOAuthAccessToken, vaultOut, purgeExpiredVault } from './vault';
+import { ensureAgentDefs, listExperts, resolveExpert, createExpert, updateExpert, deleteExpert, expertOut, validateExpertDef } from './experts';
+import harnessesJson from '../l2/harnesses.json';
+import mcpCatalogJson from '../l2/mcp-catalog.json';
+import { checkHarnessId, isValidHarnessId } from '../l2/harness-check';
+import { ensureMcpTables, connOut, listConnections, deleteConnection, upsertConnection, saveOAuthState, takeOAuthState, purgeOAuthStates, storeApiKey, storeOAuthCredential, managedRegistryEntry, genPkceWeb, buildAuthUrlWeb, safeRedirectBack } from './mcp-connections';
+import {
+  listSchedules, getSchedule, createSchedule, updateSchedule, deleteSchedule,
+  listRuns, dueSchedules, markRun, advanceSchedule, computeNextRunAt,
+} from '../l1/schedules';
+// provider-registry 的 package exports 不放行子路径——相对路径导入让打包器内联（运行时无解析）
+import providerRegistry from '../../node_modules/@mastra/core/dist/provider-registry.json';
+
+const E = env as any;
+const L2_AGENT_ID = 'l2-worker';
+const DEFAULT_PUBLIC = '';
+const publicBase = () => String(E.L1_PUBLIC_URL || DEFAULT_PUBLIC).replace(/\/$/, '');
+const callbackUrl = () => `${publicBase()}/a2a-callback`;
+/** 闹钟语义：唤醒对应房间 RoomDO，推送内容由 DO 读 D1（S2.3）。失败仅记日志不影响主流程。 */
+const notifyRoom = async (roomId: string, evt: { kind: 'message' | 'busy' | 'progress'; messageId?: string }) => {
+  try {
+    const stub = (E as any).ROOM_DO?.getByName?.(roomId);
+    if (!stub) return;
+    await stub.fetch(new Request('http://do/notify', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(evt),
+    }));
+  } catch (e: any) {
+    console.log('[L1] notifyRoom failed', String(e?.message ?? e).slice(0, 120));
+  }
+};
+/** 出口脱敏（l2-progress S2.2）：进度行进房间前抹掉内部路径/UUID/内部术语。 */
+import { sanitizeUserFacing as sanitizeProgress } from '../l1/sanitize';
+const normL2 = (u: string) => { u = u.replace(/\/$/, ''); return /\/api\/a2a\//.test(u) ? u : `${u}/api/a2a/${L2_AGENT_ID}`; };
+
+// ---------- D1 任务登记 ----------
+let schemaReady: Promise<unknown> | null = null;
+function db() {
+  const d = E.DB;
+  schemaReady ??= d.prepare(`CREATE TABLE IF NOT EXISTS l2_tasks (
+    task_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, resource_id TEXT, runtime TEXT, state TEXT NOT NULL,
+    result TEXT, reply TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, delivered INTEGER NOT NULL DEFAULT 0)`).run()
+    .then(() => d.prepare('CREATE INDEX IF NOT EXISTS l2_tasks_thread ON l2_tasks(thread_id, updated_at)').run())
+    .then(() => d.prepare('ALTER TABLE l2_tasks ADD COLUMN prompt TEXT').run().catch(() => null))
+    .then(() => d.prepare('CREATE INDEX IF NOT EXISTS l2_tasks_state ON l2_tasks(state, created_at)').run())
+    .then(() => d.prepare('ALTER TABLE rooms ADD COLUMN is_main INTEGER NOT NULL DEFAULT 0').run().catch(() => null))
+    .then(() => ensureOmTable(d))
+    .then(() => ensureProfileTable(d))
+    .then(() => ensurePersonaConfig(d))
+    .then(() => ensureVaultTable(d))
+    .then(() => d.prepare(`CREATE TABLE IF NOT EXISTS user_permission_rules (
+      user_id TEXT NOT NULL, category_or_tool TEXT NOT NULL,
+      policy TEXT NOT NULL CHECK (policy IN ('allow','ask','deny')), updated_at INTEGER NOT NULL,
+      PRIMARY KEY (user_id, category_or_tool))`).run())
+    .then(() => d.prepare(`CREATE TABLE IF NOT EXISTS user_settings (
+      user_id TEXT PRIMARY KEY, auto_review INTEGER NOT NULL DEFAULT 1, updated_at INTEGER NOT NULL)`).run())
+    .then(() => d.prepare('ALTER TABLE user_settings ADD COLUMN harness TEXT').run().catch(() => null))
+    .then(() => d.prepare('ALTER TABLE user_settings ADD COLUMN oauth_clients TEXT').run().catch(() => null))
+    .then(() => d.prepare('CREATE TABLE IF NOT EXISTS device_defaults (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER NOT NULL)').run())
+    .then(() => d.prepare(`CREATE TABLE IF NOT EXISTS schedules (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, cron TEXT NOT NULL,
+      timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai', prompt TEXT NOT NULL,
+      target_type TEXT NOT NULL CHECK (target_type IN ('room')), target_id TEXT,
+      enabled INTEGER NOT NULL DEFAULT 1, next_run_at INTEGER, last_run_at INTEGER,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`).run())
+    .then(() => d.prepare(`CREATE TABLE IF NOT EXISTS schedule_runs (
+      id TEXT PRIMARY KEY, schedule_id TEXT NOT NULL, user_id TEXT NOT NULL,
+      status TEXT NOT NULL, detail TEXT, created_at INTEGER NOT NULL)`).run())
+    .then(() => d.prepare('CREATE INDEX IF NOT EXISTS schedules_due ON schedules(enabled, next_run_at)').run())
+    .then(() => d.prepare('CREATE INDEX IF NOT EXISTS schedules_user ON schedules(user_id, enabled)').run())
+    .then(() => d.prepare('CREATE INDEX IF NOT EXISTS schedule_runs_sched ON schedule_runs(schedule_id, created_at)').run())
+    .then(() => d.prepare('ALTER TABLE l2_tasks ADD COLUMN expert_id TEXT').run().catch(() => null))
+    .then(() => d.prepare('ALTER TABLE l2_tasks ADD COLUMN instructions TEXT').run().catch(() => null))
+    .then(() => d.prepare("ALTER TABLE l2_tasks ADD COLUMN kind TEXT DEFAULT 'sandbox'").run().catch(() => null))
+    .then(() => d.prepare('ALTER TABLE l2_tasks ADD COLUMN def_json TEXT').run().catch(() => null))
+    .then(() => d.prepare('ALTER TABLE l2_tasks ADD COLUMN progress TEXT').run().catch(() => null))
+    .then(() => d.prepare('ALTER TABLE l2_tasks ADD COLUMN harness TEXT').run().catch(() => null))
+    .then(() => d.prepare('ALTER TABLE l2_tasks ADD COLUMN ask_question TEXT').run().catch(() => null))
+    .then(() => d.prepare('ALTER TABLE l2_tasks ADD COLUMN ask_answer TEXT').run().catch(() => null))
+    .then(() => d.prepare('ALTER TABLE l2_tasks ADD COLUMN ask_count INTEGER NOT NULL DEFAULT 0').run().catch(() => null))
+    .then(() => d.prepare(`CREATE TABLE IF NOT EXISTS task_artifacts (
+      id TEXT PRIMARY KEY, task_id TEXT NOT NULL, kind TEXT NOT NULL, caption TEXT, data TEXT NOT NULL,
+      created_at INTEGER NOT NULL)`).run())
+    .then(() => d.prepare('CREATE INDEX IF NOT EXISTS task_artifacts_task ON task_artifacts(task_id, created_at)').run())
+    .then(() => d.prepare('CREATE INDEX IF NOT EXISTS idx_l2_tasks_expert ON l2_tasks(expert_id, state)').run())
+    .then(() => ensureMcpTables(d))
+    .then(() => ensureAgentDefs(d));
+  return { d, ready: schemaReady };
+}
+
+// 提示词零写死（prompt-config S2.2/S2.3）：全部文案出自 persona_config——见下方 syncEngineCopy 与
+// Agent.instructions 装配；代码只做拼装。
+const dispatch_to_sandbox = createTool({
+  id: 'dispatch_to_sandbox',
+  description: '',
+  inputSchema: z.object({ prompt: z.string(), runtime: z.enum(['cloud', 'local']).default('cloud'), harness: z.string().optional().describe('指定 ACP harness（如 dsh/codebuddy/claude-code）；缺省按 账号默认 → 设备默认 兜底') }),
+  execute: async ({ prompt, runtime, harness }: any, ctx: any) => {
+    const hv = checkHarness(harness);
+    if (typeof hv === 'object') return { ok: false, reason: hv.error };
+    harness = hv || undefined;
+    const threadId: string | undefined = ctx?.agent?.threadId ?? ctx?.threadId;
+    const resourceId: string | undefined = ctx?.agent?.resourceId ?? ctx?.resourceId;
+    if (!E.PUSH_TOKEN) return { ok: false, reason: '后台回调未配置（PUSH_TOKEN 未设置）' };
+    if (!threadId) return { ok: false, reason: '缺少会话 thread，无法回传结果' };
+    const text = runtime === 'local' ? `本地 ${prompt}` : prompt;
+    const taskId = `t-${crypto.randomUUID()}`; const now = Date.now();
+    try {
+      const { d, ready } = db(); await ready;
+      // 权限策略快照（harness-registry S2.2）：随任务下发给 ACP 权限钩子
+      let policies: Record<string, string> = {};
+      let ownerId = '';
+      try {
+        const owner: any = await d.prepare('SELECT created_by FROM rooms WHERE id=?').bind(threadId).first();
+        ownerId = String(owner?.created_by ?? '');
+        const rows: any = await d.prepare("SELECT category_or_tool, policy FROM user_permission_rules WHERE user_id=?").bind(ownerId).all();
+        for (const r of rows?.results ?? []) policies[String(r.category_or_tool)] = String(r.policy);
+      } catch {}
+      // harness 默认链（S2.2）：显式 > 账号默认（设备默认由 L2 resolveHarness 兜底）
+      const hResolved = harness || (ownerId ? await defaultHarness(d, ownerId) : null) || null;
+      // 额度硬门（saas S2.4 计量点②）：长任务派发前扣减，不足即拒（三岔路提示）
+      if (ownerId) {
+        const ch = await chargeQuota(d, ownerId, { kind: 'pool', units: TASK_POINTS, idempotencyKey: `task:${taskId}`, detail: '长任务派发' });
+        if (!ch.ok) return { ok: false, reason: ch.reason };
+        if (runtime === 'cloud') {
+          const cc = await chargeQuota(d, ownerId, { kind: 'cloud', units: CLOUD_TASK_MINUTES, idempotencyKey: `cloud:${taskId}`, detail: '云端执行' });
+          if (!cc.ok) return { ok: false, reason: cc.reason };
+        }
+      }
+      await d.prepare('INSERT INTO l2_tasks (task_id,thread_id,resource_id,runtime,state,prompt,created_at,updated_at,harness,def_json) VALUES (?,?,?,?,?,?,?,?,?,?)')
+        .bind(taskId, threadId, resourceId ?? null, runtime, 'queued', text, now, now, hResolved, JSON.stringify({ policies })).run();
+      console.log('[L1] queued', JSON.stringify({ taskId, threadId, runtime }));
+      try { await notifyRoom(threadId, { kind: 'busy' }); } catch {}
+      if (E.L2_A2A_URL) {
+        try {
+          const r = await fetch(normL2(String(E.L2_A2A_URL)), {
+            method: 'POST', signal: AbortSignal.timeout(8000), headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ jsonrpc: '2.0', id: crypto.randomUUID(), method: 'message/send', params: {
+              message: { kind: 'message', role: 'user', messageId: crypto.randomUUID(), parts: [{ kind: 'text', text }] },
+              configuration: { blocking: false, pushNotificationConfig: { url: callbackUrl(), token: String(E.PUSH_TOKEN) } },
+            } }),
+          });
+          const j: any = await r.json().catch(() => null);
+          if (r.ok && j?.result?.id) {
+            const u = await d.prepare("UPDATE l2_tasks SET task_id=?, state=?, updated_at=? WHERE task_id=? AND state='queued'")
+              .bind(j.result.id, j.result.status?.state ?? 'submitted', Date.now(), taskId).run();
+            console.log('[L1] pushed via A2A', JSON.stringify({ taskId, l2TaskId: j.result.id, changed: u?.meta?.changes }));
+            // Mac 侧 DNS 污染 workers.dev → push 回调可能到不了；Worker 经 tunnel 主动 tasks/get 轮询兜底（幂等）
+            try { waitUntil(pollL2(String(j.result.id))); } catch (e: any) { console.log('[L1] waitUntil unavailable', String(e?.message ?? e)); }
+          } else console.log('[L1] A2A push failed, left queued for pull', JSON.stringify({ status: r.status, err: j?.error?.message }));
+        } catch (e: any) { console.log('[L1] A2A push error, left queued for pull', String(e?.message ?? e).slice(0, 160)); }
+      }
+      return { ok: true, status: 'queued', runtime };
+    } catch (e: any) {
+      return { ok: false, reason: `后台暂不可用（${String(e?.message ?? e).slice(0, 120)}）` };
+    }
+  },
+});
+
+// 定时例程工具（schedule-tools）：秘书从对话建档「每天早上8点…」；描述文案走 persona_config.tool_schedule
+const create_schedule_tool = createTool({
+  id: 'create_schedule',
+  description: '',
+  inputSchema: z.object({
+    name: z.string().describe('例程名称'),
+    prompt: z.string().describe('到点后执行/说的话'),
+    cron: z.string().describe('5 字段 cron（分 时 日 月 周）或预设名'),
+    timezone: z.string().optional().describe('IANA 时区，默认 Asia/Shanghai'),
+    target_id: z.string().optional().describe('目标房间 id，缺省当前会话房间'),
+  }),
+  execute: async ({ name, prompt, cron, timezone, target_id }: any, ctx: any) => {
+    try {
+      const { d, ready } = db();
+      await ready;
+      const threadId = String(target_id || ctx?.agent?.threadId || '');
+      if (!threadId) return { ok: false, reason: '缺少目标房间' };
+      const owner: any = await d.prepare('SELECT created_by FROM rooms WHERE id=?').bind(threadId).first();
+      const schedule = await createSchedule(d, String(owner?.created_by ?? ''), {
+        name, prompt, cron, timezone, target_type: 'room', target_id: threadId,
+      });
+      return { ok: true, schedule };
+    } catch (e: any) {
+      return { ok: false, reason: String(e?.message ?? e).slice(0, 160) };
+    }
+  },
+});
+
+// harness 校验/默认（harness-registry S2.2/S2.4）：显式 id 对照内置目录（未知/非 ACP 拒，防 typo 跑错）；
+// 缺省用账号默认（user_settings），设备默认（device.json）与自定义目录由 L2 resolveHarness 兜底
+const HCAT: any[] = (harnessesJson as any).harnesses ?? [];
+const checkHarness = (harness: any) => checkHarnessId(harness, HCAT);
+async function defaultHarness(d: any, userId: string): Promise<string | null> {
+  try {
+    const row: any = await d.prepare('SELECT harness FROM user_settings WHERE user_id=?').bind(userId).first();
+    return row?.harness ?? null;
+  } catch { return null; }
+}
+
+// 主题卷宗工具（topic-ia S2.3）：成卷/收卷；描述文案走 persona_config.tool_topic
+const open_topic_tool = createTool({
+  id: 'open_topic',
+  description: '',
+  inputSchema: z.object({
+    name: z.string().describe('主题名（≤30 字，如「装修」「旅行计划」）'),
+    summary: z.string().optional().describe('一句话摘要（≤60 字）'),
+  }),
+  execute: async ({ name, summary }: any, ctx: any) => {
+    try {
+      const { d, ready } = db();
+      await ready;
+      const threadId = String(ctx?.agent?.threadId || '');
+      const owner: any = threadId ? await d.prepare('SELECT created_by FROM rooms WHERE id=?').bind(threadId).first() : null;
+      const userId = String(owner?.created_by ?? '');
+      if (!userId) return { ok: false, reason: '缺少归属用户' };
+      const room = await createTopicRoom(d, memoryRef, { userId, name, summary });
+      return { ok: true, topicId: room.id, name: room.name };
+    } catch (e: any) {
+      return { ok: false, reason: String(e?.message ?? e).slice(0, 200) };
+    }
+  },
+});
+const close_topic_tool = createTool({
+  id: 'close_topic',
+  description: '',
+  inputSchema: z.object({
+    topic_id: z.string().describe('要收卷的主题 id（topic-xxx）'),
+    summary: z.string().describe('两三条要点（≤60 字），会存进主题摘要'),
+  }),
+  execute: async ({ topic_id, summary }: any, ctx: any) => {
+    try {
+      const { d, ready } = db();
+      await ready;
+      const ok = await archiveTopic(d, memoryRef, String(topic_id), String(summary ?? ''));
+      return ok ? { ok: true } : { ok: false, reason: '主题不存在或已归档' };
+    } catch (e: any) {
+      return { ok: false, reason: String(e?.message ?? e).slice(0, 200) };
+    }
+  },
+});
+
+// 任务三件套（topic-ia S2.6，Node 版 controller.ts 语义移植到 Workers 生产路径）
+const job_status_tool = createTool({
+  id: 'job_status',
+  description: '查询当前会话的后台任务进度。',
+  inputSchema: z.object({}),
+  execute: async (_i: any, ctx: any) => {
+    try {
+      const { d, ready } = db();
+      await ready;
+      const threadId = String(ctx?.agent?.threadId || '');
+      const { results } = await d
+        .prepare(`SELECT task_id, kind, state, progress FROM l2_tasks WHERE thread_id=? AND state IN ('queued','working') ORDER BY created_at DESC LIMIT 5`)
+        .bind(threadId)
+        .all();
+      const jobs = (results ?? []).map((r: any) => {
+        let last = '';
+        try {
+          const arr = JSON.parse(r.progress ?? '[]');
+          last = String(arr?.at(-1)?.msg ?? '');
+        } catch {}
+        return { id: String(r.task_id).slice(0, 8), kind: r.kind ?? 'sandbox', status: r.state, last: last.slice(0, 120) };
+      });
+      return { jobs };
+    } catch (e: any) {
+      return { jobs: [], error: String(e?.message ?? e).slice(0, 120) };
+    }
+  },
+});
+const cancel_job_tool = createTool({
+  id: 'cancel_job',
+  description: '取消当前会话最近一个进行中的后台任务（job_id 可选，缺省最近一个）。',
+  inputSchema: z.object({ job_id: z.string().optional().describe('任务 id 前缀，缺省最近一个') }),
+  execute: async ({ job_id }: any, ctx: any) => {
+    try {
+      const { d, ready } = db();
+      await ready;
+      const threadId = String(ctx?.agent?.threadId || '');
+      const rec: any = job_id
+        ? await d.prepare(`SELECT task_id, runtime FROM l2_tasks WHERE thread_id=? AND task_id LIKE ? AND state IN ('queued','working')`).bind(threadId, `${job_id}%`).first()
+        : await d.prepare(`SELECT task_id, runtime FROM l2_tasks WHERE thread_id=? AND state IN ('queued','working') ORDER BY created_at DESC LIMIT 1`).bind(threadId).first();
+      if (!rec?.task_id) return { ok: false, reason: '没有进行中的任务' };
+      const u = await d.prepare(`UPDATE l2_tasks SET state='canceled', updated_at=? WHERE task_id=? AND state IN ('queued','working')`).bind(Date.now(), rec.task_id).run();
+      if (u?.meta?.changes) {
+        try {
+          const own: any = await d.prepare('SELECT created_by FROM rooms WHERE id=?').bind(threadId).first();
+          const ownId = String(own?.created_by ?? '');
+          if (ownId) {
+            await refundQuota(d, ownId, `task:${rec.task_id}`, TASK_POINTS);
+            if (String(rec.runtime) === 'cloud') await refundQuota(d, ownId, `cloud:${rec.task_id}`, CLOUD_TASK_MINUTES);
+          }
+        } catch {}
+      }
+      return u?.meta?.changes ? { ok: true, jobId: String(rec.task_id).slice(0, 8), note: '已取消（运行中的任务在执行位结束前可能仍有尾部产出）' } : { ok: false, reason: '任务已结束' };
+    } catch (e: any) {
+      return { ok: false, reason: String(e?.message ?? e).slice(0, 200) };
+    }
+  },
+});
+const follow_up_job_tool = createTool({
+  id: 'follow_up_job',
+  description: '给后台任务追加补充要求（仅未开跑的任务可追加；运行中任务完成后可发新任务）。',
+  inputSchema: z.object({ job_id: z.string().describe('任务 id 前缀'), text: z.string().describe('补充要求') }),
+  execute: async ({ job_id, text }: any, ctx: any) => {
+    try {
+      const { d, ready } = db();
+      await ready;
+      const threadId = String(ctx?.agent?.threadId || '');
+      const rec: any = await d.prepare(`SELECT task_id, state, prompt FROM l2_tasks WHERE thread_id=? AND task_id LIKE ?`).bind(threadId, `${job_id}%`).first();
+      if (!rec?.task_id) return { ok: false, reason: '任务不存在' };
+      if (rec.state !== 'queued') return { ok: false, reason: rec.state === 'working' ? '任务进行中，协议限制无法中途追加；完成后可发一条新任务' : '任务已结束' };
+      await d.prepare('UPDATE l2_tasks SET prompt=?, updated_at=? WHERE task_id=?')
+        .bind(`${String(rec.prompt ?? '')}\n【补充要求】${String(text).slice(0, 2000)}`, Date.now(), rec.task_id).run();
+      return { ok: true, jobId: String(rec.task_id).slice(0, 8) };
+    } catch (e: any) {
+      return { ok: false, reason: String(e?.message ?? e).slice(0, 200) };
+    }
+  },
+});
+
+// Pages 发布工具（pages-hosting S2.2 通道 B）：聊天里让秘书直接发布 HTML 页面；描述走 persona_config.tool_page
+const publish_page_tool = createTool({
+  id: 'publish_page',
+  description: '',
+  inputSchema: z.object({
+    title: z.string().describe('页面标题（≤120 字）'),
+    html: z.string().describe('完整 HTML 文档（≤2MB，含 <!DOCTYPE html>）'),
+  }),
+  execute: async ({ title, html }: any, ctx: any) => {
+    try {
+      const { d, ready } = db();
+      await ready;
+      const threadId = String(ctx?.agent?.threadId || '');
+      const owner: any = threadId ? await d.prepare('SELECT created_by FROM rooms WHERE id=?').bind(threadId).first() : null;
+      const pub = await publishPage(E as any, {
+        html: String(html).slice(0, 2_000_000),
+        title: String(title || '页面'),
+        taskId: null,
+        roomId: threadId || null,
+        userId: String(owner?.created_by ?? '') || null,
+      });
+      if (!pub) return { ok: false, reason: '页面发布失败（Pages 上传出错）' };
+      // 房间卡片消息（与 [artifact:id] 同构）
+      if (threadId) {
+        const msgId = `msg-${crypto.randomUUID()}`;
+        await d.prepare('INSERT INTO messages (id,room_id,user_id,role,content,created_at) VALUES (?,?,?,?,?,?)')
+          .bind(msgId, threadId, null, 'assistant', `[page:${pub.id}] ${pub.title}｜${pub.url}`, Date.now()).run();
+        await d.prepare('UPDATE rooms SET updated_at=? WHERE id=?').bind(Date.now(), threadId).run();
+        try { await notifyRoom(threadId, { kind: 'message', messageId: msgId }); } catch {}
+      }
+      return { ok: true, pageId: pub.id, url: pub.url };
+    } catch (e: any) {
+      return { ok: false, reason: String(e?.message ?? e).slice(0, 200) };
+    }
+  },
+});
+
+// 专家派发工具（l2-experts S2.4）：任务进 l2_tasks(kind=expert)，L2（用户电脑/云电脑）执行
+const dispatch_expert_tool = createTool({
+  id: 'dispatch_to_expert',
+  description: '',
+  inputSchema: z.object({
+    expert: z.string().describe('专家名或 id（如 调研专家/researcher、工程师/coder）'),
+    task: z.string().describe('交给专家的任务内容'),
+    runtime: z.enum(['cloud', 'local']).default('local').describe('执行位：local=用户电脑，cloud=云电脑'),
+    harness: z.string().optional().describe('指定 ACP harness（如 dsh/codebuddy/claude-code），覆盖专家默认'),
+  }),
+  execute: async ({ expert, task, runtime, harness }: any, ctx: any) => {
+    try {
+      const hv = checkHarness(harness);
+      if (typeof hv === 'object') return { ok: false, reason: hv.error };
+      harness = hv || undefined;
+      const { d, ready } = db();
+      await ready;
+      const def = await resolveExpert(d, String(expert ?? ''));
+      if (!def) return { ok: false, reason: `没有这位专家：${expert}（用 list_experts 查看目录）` };
+      const threadId = String(ctx?.agent?.threadId ?? '');
+      const resourceId = String(ctx?.agent?.resourceId ?? '');
+      if (!E.PUSH_TOKEN) return { ok: false, reason: '后台回调未配置（PUSH_TOKEN 未设置）' };
+      if (!threadId) return { ok: false, reason: '缺少会话 thread，无法派发' };
+      const taskId = `t-${crypto.randomUUID()}`;
+      const now = Date.now();
+      // 权限策略快照（cua-sandbox-provider S2.3）：computer/execute 类随任务下发，L2 工具面消费
+      let policies: Record<string, string> = {};
+      let progressDesc = '', askDesc = '', artifactDesc = '';
+      let ownerId = '';
+      try {
+        const owner: any = await d.prepare('SELECT created_by FROM rooms WHERE id=?').bind(threadId).first();
+        ownerId = String(owner?.created_by ?? '');
+        const rows: any = await d.prepare("SELECT category_or_tool, policy FROM user_permission_rules WHERE user_id=?").bind(ownerId).all();
+        for (const r of rows?.results ?? []) policies[String(r.category_or_tool)] = String(r.policy);
+        const personaCfg = await getPersona(E.DB);
+        progressDesc = String(personaCfg.tool_progress ?? '');
+        askDesc = String(personaCfg.tool_ask ?? '');
+        artifactDesc = String(personaCfg.tool_artifact ?? '');
+      } catch {}
+      // 定义快照（expert-forge S2.1）：完整 agent_defs 行随任务下发，L2 侧 JIT 构建；secretRef 不含明文
+      const defJson = JSON.stringify({
+        id: def.id, name: def.name, description: def.description, instructions: def.instructions,
+        model: def.model ?? null, tools_json: def.tools_json ?? null, mcp_json: def.mcp_json ?? null,
+        skills_json: def.skills_json ?? null, memory_json: def.memory_json ?? null, updated_at: def.updated_at,
+        policies,
+        progress_desc: progressDesc || null, ask_desc: askDesc || null, artifact_desc: artifactDesc || null,
+      });
+      const hResolved = harness || (ownerId ? await defaultHarness(d, ownerId) : null) || null;
+      // 额度硬门（saas S2.4 计量点②）：专家任务同价扣减
+      if (ownerId) {
+        const ch = await chargeQuota(d, ownerId, { kind: 'pool', units: TASK_POINTS, idempotencyKey: `task:${taskId}`, detail: '专家任务派发' });
+        if (!ch.ok) return { ok: false, reason: ch.reason };
+        if (runtime === 'cloud') {
+          const cc = await chargeQuota(d, ownerId, { kind: 'cloud', units: CLOUD_TASK_MINUTES, idempotencyKey: `cloud:${taskId}`, detail: '云端执行' });
+          if (!cc.ok) return { ok: false, reason: cc.reason };
+        }
+      }
+      await d.prepare('INSERT INTO l2_tasks (task_id,thread_id,resource_id,runtime,state,prompt,created_at,updated_at,kind,expert_id,instructions,def_json,harness) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
+        .bind(taskId, threadId, resourceId || null, runtime, 'queued', String(task).slice(0, 20000), now, now, 'expert', def.id, def.instructions, defJson, hResolved)
+        .run();
+      try { await notifyRoom(threadId, { kind: 'busy' }); } catch {}
+      return { ok: true, status: 'queued', expert: def.name, expertId: def.id, taskId };
+    } catch (e: any) {
+      return { ok: false, reason: String(e?.message ?? e).slice(0, 160) };
+    }
+  },
+});
+
+const list_experts_tool = createTool({
+  id: 'list_experts',
+  description: '查看 L2 专家目录（名称、专长说明）。',
+  inputSchema: z.object({}),
+  execute: async () => {
+    try {
+      const { d, ready } = db();
+      await ready;
+      return { ok: true, experts: (await listExperts(d)).map((e: any) => ({ id: e.id, name: e.name, description: e.description })) };
+    } catch (e: any) {
+      return { ok: false, reason: String(e?.message ?? e).slice(0, 160) };
+    }
+  },
+});
+
+// 专家工坊（expert-forge S2.2）：draft 出草案（零副作用）→ 主人确认 → save 落库
+const DraftSchema = z.object({
+  id: z.string().nullable().optional(),
+  name: z.string(),
+  description: z.string().nullable().optional(),
+  instructions: z.string(),
+  model: z.string().nullable().optional(),
+  tools_json: z.any().nullable().optional(),
+  mcp_json: z.any().nullable().optional(),
+  skills_json: z.any().nullable().optional(),
+  memory_json: z.any().nullable().optional(),
+  rationale: z.string().nullable().optional(),
+});
+
+const draft_expert_tool = createTool({
+  id: 'draft_expert',
+  description: '',
+  inputSchema: z.object({
+    need: z.string().describe('主人对专家的需求描述'),
+    based_on: z.string().optional().describe('基于哪位已有专家修改（可选，名称或 id）'),
+  }),
+  execute: async ({ need, based_on }: any) => {
+    try {
+      const p = await getPersona(E.DB);
+      let ref: any = null;
+      if (based_on) {
+        const { d, ready } = db(); await ready;
+        ref = await resolveExpert(d, String(based_on));
+        if (!ref) return { ok: false, reason: `没有这位专家：${based_on}` };
+      }
+      const builder = new Agent({
+        id: 'expert-forge', name: '专家工坊',
+        instructions: p.builder_prompt,
+        model: buildModelId(p) as any,
+      } as any);
+      const userMsg = ref
+        ? `基于现有专家【${ref.name}】的定义修改：${JSON.stringify(expertOut(ref))}\n\n新需求：${need}`
+        : `需求：${need}`;
+      const res: any = await builder.generate([{ role: 'user', content: userMsg }], { output: DraftSchema } as any);
+      let draft: any = (res as any)?.output ?? null;
+      if (!draft) {
+        const m = String(res?.text ?? '').match(/\{[\s\S]*\}/);
+        draft = m ? JSON.parse(m[0]) : null;
+      }
+      if (!draft?.name || !draft?.instructions) return { ok: false, reason: '工坊未能生成有效草案' };
+      const v = validateExpertDef(draft);
+      if (!v.ok) return { ok: false, reason: `草案未过自检：${v.error}` };
+      return { ok: true, summary: draft.rationale ?? '', draft };
+    } catch (e: any) {
+      return { ok: false, reason: String(e?.message ?? e).slice(0, 160) };
+    }
+  },
+});
+
+const save_expert_tool = createTool({
+  id: 'save_expert',
+  description: '',
+  inputSchema: z.object({
+    draft: z.any().describe('完整专家定义 JSON（draft_expert 产物，可含 overwrite:true 覆盖同 id）'),
+  }),
+  execute: async ({ draft }: any, ctx: any) => {
+    try {
+      const v = validateExpertDef(draft);
+      if (!v.ok) return { ok: false, reason: v.error };
+      const { d, ready } = db();
+      await ready;
+      const threadId = String(ctx?.agent?.threadId ?? '');
+      const owner: any = threadId ? await d.prepare('SELECT created_by FROM rooms WHERE id=?').bind(threadId).first() : null;
+      const ownerId = String(owner?.created_by ?? '');
+      if (!ownerId) return { ok: false, reason: '无法确定专家归属（缺少会话）' };
+      // HITL 硬闸（评审 MAJOR）：permissions 默认 ask → 最近一条用户消息必须含确认词；deny 直接拒
+      const rule: any = await d.prepare("SELECT policy FROM user_permission_rules WHERE user_id=? AND category_or_tool='save_expert'").bind(ownerId).first();
+      const policy = String(rule?.policy ?? 'ask');
+      if (policy === 'deny') return { ok: false, reason: '主人已禁止保存专家定义（permissions: deny）' };
+      if (policy !== 'allow') {
+        const last: any = threadId ? await d.prepare("SELECT content FROM messages WHERE room_id=? AND role='user' ORDER BY created_at DESC LIMIT 1").bind(threadId).first() : null;
+        if (!/确认|同意|就这样|可以了|approved/i.test(String(last?.content ?? ''))) {
+          return { ok: false, reason: '需要主人明确确认后才能保存专家定义——请主人在对话里说「确认保存」后再试' };
+        }
+      }
+      const existing = await resolveExpert(d, String(draft.id ?? draft.name ?? ''));
+      if (existing && draft.overwrite) {
+        const r: any = await updateExpert(d, existing.id, draft, ownerId);
+        if (!r) return { ok: false, reason: '覆盖失败：专家不存在或无权修改' };
+        return r?.error ? { ok: false, reason: r.error } : { ok: true, expert: expertOut(r), overwritten: true };
+      }
+      let id = String(draft.id ?? '').trim().replace(/[^\w-]/g, '').slice(0, 40);
+      if (existing) id = `${id || 'exp'}-${Date.now().toString(36).slice(-4)}`;
+      const r: any = await createExpert(d, ownerId, { ...draft, id: id || undefined });
+      return r?.error ? { ok: false, reason: r.error } : { ok: true, expert: expertOut(r) };
+    } catch (e: any) {
+      return { ok: false, reason: String(e?.message ?? e).slice(0, 160) };
+    }
+  },
+});
+
+const list_schedules_tool = createTool({
+  id: 'list_schedules',
+  description: '查看全部定时例程（名称、cron、下次执行时间、启用状态）。',
+  inputSchema: z.object({}),
+  execute: async (_args: any, ctx: any) => {
+    try {
+      const { d, ready } = db();
+      await ready;
+      const threadId = String(ctx?.agent?.threadId ?? '');
+      const owner: any = threadId ? await d.prepare('SELECT created_by FROM rooms WHERE id=?').bind(threadId).first() : null;
+      const schedules = await listSchedules(d, String(owner?.created_by ?? ''));
+      return { ok: true, schedules };
+    } catch (e: any) {
+      return { ok: false, reason: String(e?.message ?? e).slice(0, 160) };
+    }
+  },
+});
+
+const delete_schedule_tool = createTool({
+  id: 'delete_schedule',
+  description: '删除一个定时例程（先用 list_schedules 查 id）。',
+  inputSchema: z.object({ id: z.string().describe('例程 id') }),
+  execute: async ({ id }: any, ctx: any) => {
+    try {
+      const { d, ready } = db();
+      await ready;
+      const threadId = String(ctx?.agent?.threadId ?? '');
+      const owner: any = threadId ? await d.prepare('SELECT created_by FROM rooms WHERE id=?').bind(threadId).first() : null;
+      const okDel = await deleteSchedule(d, String(owner?.created_by ?? ''), String(id));
+      return okDel ? { ok: true } : { ok: false, reason: '没找到这个例程' };
+    } catch (e: any) {
+      return { ok: false, reason: String(e?.message ?? e).slice(0, 160) };
+    }
+  },
+});
+
+// D1 存储单例：Mastra 与 Memory 共用；OM 扩展面装饰到 memory domain（observational-memory S2.1）。
+// 绑定（DB 等）在请求期才注入 env——store 必须懒建（构建器会把 new Mastra(...) 包成惰性工厂，请求期才调用）。
+let _store: any = null;
+const getStore = () => (_store ??= new D1Store({ id: 'l1-d1', binding: E.DB }));
+let omInstalled = false;
+const ensureOmInstalled = () => {
+  if (omInstalled) return;
+  try {
+    installD1OmSupport(getStore().stores?.memory, E.DB);
+    omInstalled = true;
+  } catch (e: any) {
+    console.log('[OM] install deferred', String(e?.message ?? e).slice(0, 120));
+  }
+};
+const vectorStore = new VectorizeStore({ index: () => E.VECTORIZE, observationsIndex: () => E.VECTORIZE_OBS });
+
+// 主人画像抽取（S2.3）：从【名字】发言归集稳定信息到 om_profiles（多用户共享 thread 时 working memory 装不下主人画像）
+const userProfileExtractor = new Extractor({
+  name: 'User profile',
+  instructions: '从带【名字】前缀的发言中抽取每位发言者的稳定信息（称呼/时区/偏好/在做的事/事实）。只记稳定信息，不记一次性寒暄；每个条目的 speaker 填【名字】里的名字。',
+  schema: z.object({
+    people: z.array(z.object({
+      speaker: z.string(),
+      name: z.string().optional(),
+      preferredName: z.string().optional(),
+      timezone: z.string().optional(),
+      preferences: z.array(z.string()).optional(),
+      ongoing: z.array(z.string()).optional(),
+      facts: z.array(z.string()).optional(),
+    })),
+  }),
+  onExtracted: async ({ current }: any) => {
+    for (const p of current?.people ?? []) {
+      try {
+        const u = await resolveUserByName(E.DB, String(p?.speaker ?? ''));
+        if (!u) continue;
+        await upsertProfile(E.DB, {
+          userId: u.id, email: u.email, name: u.name,
+          payload: { name: p.name, preferredName: p.preferredName, timezone: p.timezone, preferences: p.preferences, ongoing: p.ongoing, facts: p.facts },
+        });
+      } catch (e: any) {
+        console.log('[OM] profile upsert failed', String(e?.message ?? e).slice(0, 120));
+      }
+    }
+    return current;
+  },
+});
+
+// 引擎/工具创建时读取的文案（S2.1 生效语义：冷启动）：可变引用传入，创建前的更新都能生效。
+const omObservationCfg = {
+  messageTokens: 2_000, bufferTokens: 0.25, bufferOnIdle: true, activateAfterIdle: 300_000, failurePolicy: 'continue',
+  instruction: '', extract: [userProfileExtractor],
+} as any;
+const omReflectionCfg = { observationTokens: 8_000, failurePolicy: 'continue', instruction: '' } as any;
+
+export async function syncEngineCopy(p?: { om_observe: string; om_reflect: string; tool_dispatch: string; model_gateway: string; model_name: string; model_effort: string }) {
+  try {
+    const persona = p ?? (await getPersona(E.DB));
+    omObservationCfg.instruction = persona.om_observe;
+    omReflectionCfg.instruction = persona.om_reflect;
+    // Memory 构造时把 options 拷进 threadConfig——必须同步补实例上的这份（引擎初始化读它）；
+    // 引擎创建后改这里不再热生效（引擎快照），冷启动兜底（S2.1 生效语义）。
+    const tc: any = (memoryRef as any)?.threadConfig;
+    if (tc?.observationalMemory?.observation) {
+      tc.observationalMemory.observation.instruction = persona.om_observe;
+      tc.observationalMemory.observation.modelSettings = { ...(tc.observationalMemory.observation.modelSettings ?? {}), reasoning: persona.model_effort };
+    }
+    if (tc?.observationalMemory?.reflection) {
+      tc.observationalMemory.reflection.instruction = persona.om_reflect;
+      tc.observationalMemory.reflection.modelSettings = { ...(tc.observationalMemory.reflection.modelSettings ?? {}), reasoning: persona.model_effort };
+    }
+    if (tc?.observationalMemory) tc.observationalMemory.model = buildModelId(persona);
+    (dispatch_to_sandbox as any).description = persona.tool_dispatch;
+    (create_schedule_tool as any).description = persona.tool_schedule;
+    (dispatch_expert_tool as any).description = persona.tool_expert;
+    (draft_expert_tool as any).description = persona.tool_forge;
+    (save_expert_tool as any).description = persona.tool_forge;
+    (open_topic_tool as any).description = persona.tool_topic;
+    (close_topic_tool as any).description = persona.tool_topic;
+    (publish_page_tool as any).description = persona.tool_page;
+  } catch {}
+}
+
+// 会话记忆：D1 + OM（Observer/Reflector 观测日志）+ Vectorize 语义召回；thread = roomId。
+// 不显式传 storage（构建期无 env 会炸 D1Store 初始化）；Memory 经 Mastra 注册拿到同一个 store。
+const memoryRef = new Memory({
+  vector: vectorStore,
+  embedder: createWorkersAiEmbedder(() => E.AI),
+  options: {
+    lastMessages: 20,
+    // 消息向量 RAG（memory-recall-search S2.2）：saveMessages 时嵌入 memory_messages_1024，
+    // 与 OM 观测检索互补——OM 管压缩摘要，semanticRecall 找回沉出窗口的原始消息。
+    semanticRecall: { topK: 5, messageRange: 2, scope: 'resource' },
+    observationalMemory: {
+      model: SEED_MODEL_ID,
+      retrieval: { vector: true },
+      observation: omObservationCfg,
+      reflection: omReflectionCfg,
+    },
+  },
+});
+// memoryRef 就绪后做首次同步（模块加载时尚未声明，不能提前调）
+syncEngineCopy();
+
+/** thread 作用域提示词块（语调+画像）：chat 与后台汇报共用的消息级 system 前置（S2.3）。 */
+async function withThreadBlock(messages: any[], threadId: string | undefined): Promise<any[]> {
+  try {
+    const block = await buildThreadBlock(E.DB, threadId, loadRoomProfileBlock);
+    if (block) return [{ role: 'system', content: block }, ...messages];
+  } catch (e: any) {
+    console.log('[persona] thread block failed', String(e?.message ?? e).slice(0, 120));
+  }
+  return messages;
+}
+
+// 提示词装配（S2.3）：基座+身份走 Agent.instructions（官方函数槽位）；语调+画像走
+// 消息级 system 前置（withThreadBlock，chat 与后台汇报共用）。
+const orchestrator = new Agent({
+  id: 'orchestrator',
+  name: 'orchestrator',
+  instructions: async () => {
+    const p = await getPersona(E.DB);
+    return `${p.base_prompt}\n${personaBlock(p)}`;
+  },
+  // 模型与 effort 全配置（model-gateway-config S2.1）：官方 DynamicArgument 函数槽位，每轮求值
+  model: async () => {
+    const p = await getPersona(E.DB);
+    return buildModelId(p) as any;
+  },
+  modelSettings: async () => {
+    const p = await getPersona(E.DB);
+    return { reasoning: p.model_effort } as any;
+  },
+  tools: { dispatch_to_sandbox, dispatch_to_expert: dispatch_expert_tool, list_experts: list_experts_tool, draft_expert: draft_expert_tool, save_expert: save_expert_tool, create_schedule: create_schedule_tool, list_schedules: list_schedules_tool, delete_schedule: delete_schedule_tool, open_topic: open_topic_tool, close_topic: close_topic_tool, job_status: job_status_tool, cancel_job: cancel_job_tool, follow_up_job: follow_up_job_tool, publish_page: publish_page_tool },
+  memory: memoryRef,
+});
+
+const tokenOk = (got?: string | null) => {
+  const want = E.PUSH_TOKEN ? String(E.PUSH_TOKEN) : '';
+  if (!got || !want) return false;
+  const a = Buffer.from(got), b = Buffer.from(want);
+  return a.length === b.length && timingSafeEqual(a, b);
+};
+const reqToken = (c: any) => {
+  const auth = c.req.header('Authorization') ?? '';
+  return auth.startsWith('Bearer ') ? auth.slice(7) : c.req.header('X-A2A-Notification-Token');
+};
+
+const TERMINAL = ['completed', 'failed', 'canceled', 'rejected'];
+const extractTask = (task: any) => {
+  let text = (task.artifacts ?? []).flatMap((a: any) => a.parts ?? []).filter((p: any) => p.kind === 'text').map((p: any) => p.text).join('\n')
+    || task.status?.message?.parts?.map((p: any) => p.text).join('') || '';
+  let state = String(task.status?.state ?? '');
+  if (state === 'completed' && text.startsWith('【L2失败】')) { state = 'failed'; text = text.slice(6); }
+  return { state, text };
+};
+/** 写入终态并 compose 回复；幂等（已终态则忽略）。返回 compose promise（若有） */
+const finalizeTask = async (taskId: string, state: string, text: string, src: string): Promise<{ ignored?: string; compose?: Promise<void> }> => {
+  const { d, ready } = db(); await ready;
+  const rec: any = await d.prepare('SELECT * FROM l2_tasks WHERE task_id=?').bind(taskId).first();
+  console.log('[L1] finalize', JSON.stringify({ src, taskId, state, known: !!rec, chars: text.length }));
+  if (!rec) return { ignored: 'unknown task' };
+  if (TERMINAL.includes(rec.state)) return { ignored: 'duplicate' };
+  const u = await d.prepare(`UPDATE l2_tasks SET state=?, result=?, updated_at=? WHERE task_id=? AND state NOT IN ('completed','failed','canceled','rejected')`)
+    .bind(state, text.slice(0, 20000), Date.now(), taskId).run();
+  if (!TERMINAL.includes(state) || !u?.meta?.changes) return {};
+  // 退补（saas S2.4）：失败/取消/拒绝按幂等键退回长任务分
+  if (state !== 'completed') {
+    try {
+      const own: any = await d.prepare('SELECT created_by FROM rooms WHERE id=?').bind(rec.thread_id).first();
+      const ownId = String(own?.created_by ?? '');
+      if (ownId) {
+        await refundQuota(d, ownId, `task:${taskId}`, TASK_POINTS);
+        if (String(rec.runtime) === 'cloud') await refundQuota(d, ownId, `cloud:${taskId}`, CLOUD_TASK_MINUTES);
+      }
+    } catch (e: any) { console.log('[quota] refund failed', String(e?.message ?? e).slice(0, 120)); }
+  }
+  const compose = (async () => {
+    let reply = '';
+    try {
+      const progN = (() => { try { return (rec as any).progress ? JSON.parse((rec as any).progress).length : 0; } catch { return 0; } })();
+      const composePrompt = `<sandbox-result state="${state}">${text.slice(0, 8000)}</sandbox-result>\n（这是后台任务的结果通知，不是用户消息；请直接向用户简要汇报${progN ? `；任务期间已向主人播报过 ${progN} 条进度，不必重复` : ''}）`;
+      const res: any = await orchestrator.generate(
+        await withThreadBlock([{ role: 'user', content: composePrompt }], rec.thread_id),
+        { memory: { thread: rec.thread_id, resource: rec.resource_id ?? `room:${rec.thread_id}` }, maxSteps: 1 } as any);
+      reply = String(res?.text ?? '').slice(0, 8000);
+      await d.prepare('UPDATE l2_tasks SET reply=?, updated_at=? WHERE task_id=?').bind(reply, Date.now(), taskId).run();
+    } catch (e: any) { console.log('[L1] compose failed', String(e?.message ?? e).slice(0, 200)); }
+    // S2.5：后台结果落成房间 assistant 消息（room_id = thread_id）——compose 失败也要落（降级用原始 result）
+    try {
+      const content = reply || (state === 'completed' ? `处理好了：${text.slice(0, 2000)}` : '这次后台处理没成功，请稍后再试。');
+      const msgId = `msg-${crypto.randomUUID()}`;
+      await d.prepare('INSERT INTO messages (id,room_id,user_id,role,content,created_at) VALUES (?,?,?,?,?,?)')
+        .bind(msgId, rec.thread_id, null, 'assistant', content, Date.now()).run();
+      await d.prepare('UPDATE rooms SET updated_at=? WHERE id=?').bind(Date.now(), rec.thread_id).run();
+      try { await notifyRoom(rec.thread_id, { kind: 'message', messageId: msgId }); } catch {}
+    } catch (e: any) { console.log('[L1] result->messages failed', String(e?.message ?? e).slice(0, 160)); }
+    try { await notifyRoom(rec.thread_id, { kind: 'busy' }); } catch {}
+  })();
+  return { compose };
+};
+/** Worker → tunnel → L2 A2A tasks/get 轮询，直到终态或超时 */
+const pollL2 = (id: string) => pollL2Task(id, { url: () => normL2(String(E.L2_A2A_URL)), getState: async (tid) => { const { d, ready } = db(); await ready; return ((await d.prepare('SELECT state FROM l2_tasks WHERE task_id=?').bind(tid).first()) as any)?.state ?? null; }, terminal: TERMINAL, extract: extractTask, finalize: finalizeTask });
+
+export const mastra = new Mastra({
+  agents: { orchestrator },
+  storage: getStore(),
+  deployer: new CloudflareDeployer({
+    name: 'mastra-l1',
+    compatibility_date: '2026-10-01',
+    compatibility_flags: ['nodejs_compat'],
+    vars: { NODE_ENV: 'production', L1_PUBLIC_URL: DEFAULT_PUBLIC },
+    d1_databases: [{ binding: 'DB', database_name: 'mastra-l1', database_id: '' }],
+  } as any),
+  server: {
+    auth: buildMastraAuth(E as any) as any,
+    apiRoutes: [
+      ...(E.PROBE_ROUTES === '1' ? probeRoutes() : []),
+      registerApiRoute('/health-l1', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c) => {
+          let queued: number | null = null;
+          try { const { d, ready } = db(); await ready; queued = ((await d.prepare("SELECT COUNT(*) n FROM l2_tasks WHERE state='queued'").first()) as any)?.n ?? 0; } catch {}
+          return c.json({ ok: true, role: 'l1-mastra-cf', pullMode: true, claim: `${publicBase()}/l2-claim`, queued, l2Configured: !!E.L2_A2A_URL, pushToken: !!E.PUSH_TOKEN, callback: callbackUrl() });
+        },
+      } as any),
+      // 产品名（白牌化）：登录页/标题用，公开不鉴权
+      registerApiRoute('/brand', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const { d, ready } = db();
+          await ready;
+          const p = await getPersona(d);
+          return c.json({ productName: p.product_name });
+        },
+      } as any),
+      // OM 记忆检视（S2.5）：自己的画像、所在房间的观测日志、全量导出
+      registerApiRoute('/om/profile', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const row: any = await E.DB.prepare('SELECT payload, updated_at FROM om_profiles WHERE user_id=?').bind(u.id).first();
+          let payload: any = null;
+          try { payload = row ? JSON.parse(String(row.payload)) : null; } catch {}
+          return c.json({ user: { id: u.id, name: u.name, email: u.email }, profile: payload, updatedAt: row?.updated_at ?? null });
+        },
+      } as any),
+      registerApiRoute('/om/observations', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db(); await ready;
+          // ?all=1：本人所有房间一次拉齐（om-admin S2.1，页面时间线用）
+          if (String(c.req.query('all') ?? '') === '1') {
+            const { results: rooms } = await d.prepare('SELECT room_id FROM room_members WHERE user_id=?').bind(u.id).all();
+            const out: any[] = [];
+            for (const r of rooms ?? []) {
+              const { results } = await d.prepare(
+                'SELECT id, threadId, generationCount, activeObservations, bufferedObservationChunks, bufferedReflection, originType, createdAt, updatedAt, supersededBy FROM mastra_observational_memory WHERE threadId=? ORDER BY generationCount DESC, createdAt ASC, id ASC',
+              ).bind((r as any).room_id).all();
+              out.push({ thread: (r as any).room_id, records: results ?? [] });
+            }
+            return c.json({ all: true, rooms: out });
+          }
+          const thread = String(c.req.query('thread') ?? '');
+          if (!/^[\w-]{3,64}$/.test(thread)) return c.json({ error: 'bad thread' }, 400);
+          const m = await d.prepare('SELECT 1 AS x FROM room_members WHERE room_id=? AND user_id=?').bind(thread, u.id).first();
+          if (!m) return c.json({ error: 'not a member' }, 403);
+          const { results } = await d.prepare(
+            'SELECT id, threadId, generationCount, activeObservations, bufferedObservationChunks, bufferedReflection, originType, createdAt, updatedAt, supersededBy FROM mastra_observational_memory WHERE threadId=? ORDER BY generationCount DESC, createdAt ASC, id ASC',
+          ).bind(thread).all();
+          return c.json({ thread, records: results ?? [] });
+        },
+      } as any),
+      registerApiRoute('/om/export', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const prow: any = await E.DB.prepare('SELECT payload, updated_at FROM om_profiles WHERE user_id=?').bind(u.id).first();
+          let payload: any = null;
+          try { payload = prow ? JSON.parse(String(prow.payload)) : null; } catch {}
+          const { results: rooms } = await E.DB.prepare('SELECT room_id FROM room_members WHERE user_id=?').bind(u.id).all();
+          const observations: any[] = [];
+          for (const r of rooms ?? []) {
+            const { results } = await E.DB.prepare(
+              'SELECT threadId, generationCount, activeObservations, createdAt, supersededBy FROM mastra_observational_memory WHERE threadId=? ORDER BY generationCount DESC',
+            ).bind((r as any).room_id).all();
+            observations.push({ thread: (r as any).room_id, records: results ?? [] });
+          }
+          // ?format=md：人可读存档（om-admin S2.1）
+          if (String(c.req.query('format') ?? '') === 'md') {
+            const lines: string[] = [`# 记忆存档 — ${u.name || u.email}`, `导出时间：${new Date().toISOString()}`, ''];
+            lines.push('## 主人画像', '');
+            if (payload) {
+              if (payload.preferredName || payload.name) lines.push(`- 称呼：${payload.preferredName || payload.name}`);
+              if (payload.timezone) lines.push(`- 时区：${payload.timezone}`);
+              for (const [k, label] of [['preferences', '偏好'], ['ongoing', '进行中'], ['facts', '事实']] as const) {
+                if (Array.isArray(payload[k]) && payload[k].length) {
+                  lines.push(`- ${label}：`);
+                  for (const x of payload[k]) lines.push(`  - ${x}`);
+                }
+              }
+            } else lines.push('（暂无画像）');
+            for (const g of observations) {
+              lines.push('', `## 房间 ${g.thread}`, '');
+              for (const rec of g.records ?? []) {
+                const ts = Number(rec.createdAt);
+                const when = Number.isFinite(ts) && ts > 0 ? new Date(ts).toISOString().slice(0, 16).replace('T', ' ') : '时间未知';
+                lines.push(`### 第 ${rec.generationCount} 代 · ${when}${rec.supersededBy ? ' · 已被替代' : ''}`, '', String(rec.activeObservations ?? '').trim(), '');
+              }
+              if (!(g.records ?? []).length) lines.push('（无观测记录）', '');
+            }
+            return new Response(lines.join('\n'), {
+              status: 200,
+              headers: {
+                'content-type': 'text/markdown; charset=utf-8',
+                'content-disposition': `attachment; filename="memory-${new Date().toISOString().slice(0, 10)}.md"`,
+              },
+            });
+          }
+          return c.json({ exportedAt: Date.now(), user: { id: u.id, name: u.name, email: u.email }, profile: payload, observations });
+        },
+      } as any),
+      // ---------- OM 管理（om-admin S2.1）：检视 / 修正 / 删除 / 导出 ----------
+      registerApiRoute('/om/overview', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db(); await ready;
+          const prow: any = await d.prepare('SELECT payload, updated_at FROM om_profiles WHERE user_id=?').bind(u.id).first();
+          let payload: any = null;
+          try { payload = prow ? JSON.parse(String(prow.payload)) : null; } catch {}
+          const { results: rooms } = await d.prepare('SELECT room_id FROM room_members WHERE user_id=?').bind(u.id).all();
+          const roomsOut: any[] = [];
+          for (const r of rooms ?? []) {
+            const roomId = String((r as any).room_id);
+            const row: any = await d.prepare('SELECT COUNT(*) n, MAX(updatedAt) last FROM mastra_observational_memory WHERE threadId=?').bind(roomId).first();
+            let name = roomId;
+            try { name = String((await d.prepare('SELECT name FROM rooms WHERE id=?').bind(roomId).first())?.name ?? roomId); } catch {}
+            roomsOut.push({ thread: roomId, name, records: Number(row?.n ?? 0), lastAt: row?.last ?? null });
+          }
+          return c.json({ user: { id: u.id, name: u.name, email: u.email }, profile: payload, profileUpdatedAt: prow?.updated_at ?? null, rooms: roomsOut });
+        },
+      } as any),
+      registerApiRoute('/om/profile', {
+        method: 'PUT',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const str = (v: unknown) => String(v ?? '').trim().slice(0, 200) || undefined;
+          const list = (v: unknown) => {
+            if (!Array.isArray(v)) return [];
+            const out: string[] = [];
+            for (const x of v) {
+              const s = String(x ?? '').trim().slice(0, 200);
+              if (s && !out.includes(s)) out.push(s);
+              if (out.length >= 12) break;
+            }
+            return out;
+          };
+          // 字段白名单（评审：不收任意 JSON）；列表字段最多 12 条、单条 ≤200 字
+          const payload = {
+            name: str(body?.name), preferredName: str(body?.preferredName), timezone: str(body?.timezone),
+            preferences: list(body?.preferences), ongoing: list(body?.ongoing), facts: list(body?.facts),
+          };
+          const { d, ready } = db(); await ready;
+          await d.prepare(`INSERT INTO om_profiles (user_id, email, name, payload, updated_at) VALUES (?,?,?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at`)
+            .bind(u.id, u.email, u.name, JSON.stringify(payload), Date.now()).run();
+          return c.json({ ok: true, profile: payload });
+        },
+      } as any),
+      registerApiRoute('/om/observations/:id', {
+        method: 'PUT',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const id = String(c.req.param('id') ?? '');
+          const body: any = await c.req.json().catch(() => ({}));
+          const { d, ready } = db(); await ready;
+          const rec: any = await d.prepare('SELECT id, threadId, activeObservations, bufferedReflection FROM mastra_observational_memory WHERE id=?').bind(id).first();
+          if (!rec) return c.json({ error: 'not found' }, 404);
+          const m = await d.prepare('SELECT 1 AS x FROM room_members WHERE room_id=? AND user_id=?').bind(String(rec.threadId), u.id).first();
+          if (!m) return c.json({ error: 'not a member' }, 403);
+          const nextObs = body.activeObservations !== undefined ? String(body.activeObservations).slice(0, 20000) : null;
+          const nextRefl = body.bufferedReflection !== undefined ? String(body.bufferedReflection).slice(0, 20000) : null;
+          // 乐观并发：expected 为修改前的 activeObservations（可选）
+          const expected = body.expected !== undefined ? String(body.expected) : null;
+          const r: any = expected !== null
+            ? await d.prepare('UPDATE mastra_observational_memory SET activeObservations=COALESCE(?, activeObservations), bufferedReflection=COALESCE(?, bufferedReflection), updatedAt=? WHERE id=? AND activeObservations=?')
+                .bind(nextObs, nextRefl, Date.now(), id, expected).run()
+            : await d.prepare('UPDATE mastra_observational_memory SET activeObservations=COALESCE(?, activeObservations), bufferedReflection=COALESCE(?, bufferedReflection), updatedAt=? WHERE id=?')
+                .bind(nextObs, nextRefl, Date.now(), id).run();
+          if (!r?.meta?.changes) return c.json({ error: 'conflict：内容已被其他修改更新，请刷新后重试' }, 409);
+          return c.json({ ok: true, id });
+        },
+      } as any),
+      registerApiRoute('/om/observations/:id', {
+        method: 'DELETE',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const id = String(c.req.param('id') ?? '');
+          const { d, ready } = db(); await ready;
+          const rec: any = await d.prepare('SELECT id, threadId FROM mastra_observational_memory WHERE id=?').bind(id).first();
+          if (!rec) return c.json({ error: 'not found' }, 404);
+          const m = await d.prepare('SELECT 1 AS x FROM room_members WHERE room_id=? AND user_id=?').bind(String(rec.threadId), u.id).first();
+          if (!m) return c.json({ error: 'not a member' }, 403);
+          const del: any = await d.prepare('DELETE FROM mastra_observational_memory WHERE id=?').bind(id).run();
+          if (!del?.meta?.changes) return c.json({ error: 'not found' }, 404);
+          // 向量尽力清理（om-admin S2.3）：OM 向量按 chunk-hash id 存、record_id 只在 metadata——
+          // 必须按 filter 删（评审 MAJOR：按记录 id 删是静默 no-op，删完照样进召回）。失败不回滚 DB。
+          try {
+            await vectorStore.deleteVectors({ indexName: 'memory_observations_1024', filter: { record_id: id } });
+          } catch (e: any) {
+            console.log('[om-admin] vector cleanup failed', id, String(e?.message ?? e).slice(0, 100));
+          }
+          return c.json({ ok: true, id });
+        },
+      } as any),
+      // T7 生产实证探针（PROBE_ROUTES=1）：phase=up 走适配器 upsert；phase=del 走适配器 deleteVectors(filter)。
+      // Vectorize 索引水位线是分钟级最终一致——可见性/删除确认由调用方在外部轮询 REST 完成。
+      ...(E.PROBE_ROUTES === '1'
+        ? [
+            registerApiRoute('/probe/vector-del', {
+              method: 'GET',
+              requiresAuth: false,
+              handler: async (c: any) => {
+                try {
+                  ensureOmInstalled();
+                  const phase = String(c.req.query('phase') ?? 'up');
+                  const tag = String(c.req.query('tag') ?? `del-${Date.now()}`);
+                  const v1 = Array.from({ length: 1024 }, (_, i) => (i === 0 ? 1 : 0));
+                  const v2 = Array.from({ length: 1024 }, (_, i) => (i === 1 ? 1 : 0));
+                  if (phase === 'up') {
+                    await vectorStore.upsert({
+                      indexName: 'memory_messages_1024',
+                      vectors: [v1, v2],
+                      ids: [`${tag}-1`, `${tag}-2`],
+                      metadata: [{ thread_id: tag }, { thread_id: tag }],
+                    });
+                    return c.json({ ok: true, phase, tag });
+                  }
+                  await vectorStore.deleteVectors({ indexName: 'memory_messages_1024', filter: { thread_id: tag } });
+                  return c.json({ ok: true, phase: 'del', tag });
+                } catch (e: any) {
+                  return c.json({ ok: false, error: String(e?.message ?? e).slice(0, 300) });
+                }
+              },
+            } as any),
+          ]
+        : []),
+      // 模型目录（model-gateway-config S2.2）：从已装 provider-registry 读，级联数据源零硬编码
+      registerApiRoute('/settings/models', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const reg: any = providerRegistry;
+          const providers: any = reg?.providers ?? {};
+          const gateways = ['deepseek', 'cloudflare-workers-ai']
+            .filter((g) => providers[g])
+            .map((g) => ({ gateway: g, models: providers[g].models ?? [] }));
+          // mastra 网关不在 provider-registry（运行时 MastraGateway）——清单运行时 fetchProviders，无 key 时降级空列表
+          let mastraModels: string[] = [];
+          try {
+            const { MastraGateway } = await import('@mastra/core/llm');
+            const gw = new MastraGateway();
+            if (gw.shouldEnable?.()) {
+              const provs = await gw.fetchProviders();
+              mastraModels = Object.entries(provs ?? {}).flatMap(([prov, cfg]: any) =>
+                ((cfg?.models ?? []) as any[]).map((m: any) => `${prov}/${typeof m === 'string' ? m : m?.id ?? ''}`));
+            }
+          } catch {}
+          gateways.push({ gateway: 'mastra', models: mastraModels });
+          return c.json({
+            gateways,
+            effortLevels: ['provider-default', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+          });
+        },
+      } as any),
+      // L2 专家目录（l2-experts S2.2）：定义是数据，执行位在 L2
+      registerApiRoute('/agent-defs', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db();
+          await ready;
+          return c.json({ experts: (await listExperts(d, String(u.id))).map(expertOut) });
+        },
+      } as any),
+      registerApiRoute('/agent-defs', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const { d, ready } = db();
+          await ready;
+          try {
+            const r = await createExpert(d, String(u.id), body);
+            return (r as any).error ? c.json({ error: (r as any).error }, 400) : c.json({ expert: expertOut(r) }, 201);
+          } catch (e: any) {
+            return c.json({ error: String(e?.message ?? e).slice(0, 160) }, 400);
+          }
+        },
+      } as any),
+      registerApiRoute('/agent-defs/:id', {
+        method: 'PUT',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const { d, ready } = db();
+          await ready;
+          try {
+            const r = await updateExpert(d, String(c.req.param('id') ?? ''), body, String(u.id));
+            if (!r) return c.json({ error: 'not found' }, 404);
+            return c.json((r as any).error ? { error: (r as any).error } : { expert: expertOut(r) }, (r as any).error ? 400 : 200);
+          } catch (e: any) {
+            return c.json({ error: String(e?.message ?? e).slice(0, 160) }, 400);
+          }
+        },
+      } as any),
+      registerApiRoute('/agent-defs/:id', {
+        method: 'DELETE',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db();
+          await ready;
+          const okDel = await deleteExpert(d, String(c.req.param('id') ?? ''), String(u.id));
+          return c.json(okDel ? { ok: true } : { error: 'not found' }, okDel ? 200 : 404);
+        },
+      } as any),
+      // 定时任务（schedules-secrets S2.1）：cron 例程，执行走 Workers cron tick
+      registerApiRoute('/schedules', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db();
+          await ready;
+          return c.json({ schedules: await listSchedules(d, u.id) });
+        },
+      } as any),
+      registerApiRoute('/schedules', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const { d, ready } = db();
+          await ready;
+          try {
+            return c.json({ schedule: await createSchedule(d, u.id, body) }, 201);
+          } catch (e: any) {
+            return c.json({ error: String(e?.message ?? e).slice(0, 160) }, 400);
+          }
+        },
+      } as any),
+      registerApiRoute('/schedules/:id', {
+        method: 'PUT',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const { d, ready } = db();
+          await ready;
+          try {
+            const schedule = await updateSchedule(d, u.id, String(c.req.param('id') ?? ''), body);
+            return schedule ? c.json({ schedule }) : c.json({ error: 'not found' }, 404);
+          } catch (e: any) {
+            return c.json({ error: String(e?.message ?? e).slice(0, 160) }, 400);
+          }
+        },
+      } as any),
+      registerApiRoute('/schedules/:id', {
+        method: 'DELETE',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db();
+          await ready;
+          const okDel = await deleteSchedule(d, u.id, String(c.req.param('id') ?? ''));
+          return c.json(okDel ? { ok: true } : { error: 'not found' }, okDel ? 200 : 404);
+        },
+      } as any),
+      registerApiRoute('/schedules/:id/runs', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db();
+          await ready;
+          return c.json({ runs: await listRuns(d, u.id, String(c.req.param('id') ?? '')) });
+        },
+      } as any),
+      // 权限数据面（schedules-secrets S2.2）：allow/ask/deny 规则 + 用户设置；消费方（HITL）后续接入
+      registerApiRoute('/permissions', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db();
+          await ready;
+          const rules = (await d.prepare('SELECT category_or_tool, policy, updated_at FROM user_permission_rules WHERE user_id=?').bind(u.id).all()).results ?? [];
+          const settings: any = await d.prepare('SELECT auto_review, updated_at FROM user_settings WHERE user_id=?').bind(u.id).first();
+          return c.json({ rules, settings: settings ?? { auto_review: 1 } });
+        },
+      } as any),
+      registerApiRoute('/permissions', {
+        method: 'PUT',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const { d, ready } = db();
+          await ready;
+          if (Array.isArray(body?.rules)) {
+            for (const r of body.rules) {
+              const cat = String(r?.category_or_tool ?? '').trim().slice(0, 100);
+              const policy = String(r?.policy ?? '');
+              if (!cat || !['allow', 'ask', 'deny'].includes(policy)) continue;
+              await d.prepare(`INSERT INTO user_permission_rules (user_id, category_or_tool, policy, updated_at) VALUES (?,?,?,?)
+                ON CONFLICT(user_id, category_or_tool) DO UPDATE SET policy=excluded.policy, updated_at=excluded.updated_at`)
+                .bind(u.id, cat, policy, Date.now()).run();
+            }
+          }
+          if (body?.auto_review !== undefined) {
+            await d.prepare(`INSERT INTO user_settings (user_id, auto_review, updated_at) VALUES (?,?,?)
+              ON CONFLICT(user_id) DO UPDATE SET auto_review=excluded.auto_review, updated_at=excluded.updated_at`)
+              .bind(u.id, body.auto_review ? 1 : 0, Date.now()).run();
+          }
+          const rules = (await d.prepare('SELECT category_or_tool, policy, updated_at FROM user_permission_rules WHERE user_id=?').bind(u.id).all()).results ?? [];
+          return c.json({ rules });
+        },
+      } as any),
+      // 密钥保管（schedules-secrets S2.3）：Secrets Store 托管，D1 只存元数据，不回密文
+      registerApiRoute('/vault', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db();
+          await ready;
+          return c.json({ entries: (await listVaultEntries(d, u.id)).map(vaultOut) });
+        },
+      } as any),
+      registerApiRoute('/vault', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          // 设备令牌路径（mcp-library S2.3）：桌面 oauth-connect 存凭证用
+          const device = !u && tokenOk(reqToken(c));
+          if (!u && !device) return c.json({ error: 'unauthorized' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const { d, ready } = db();
+          await ready;
+          const userId = u ? u.id : 'device';
+          // OAuth 凭证包走专用校验（mcp-library S2.2）：access_token/client_id/token_url 必填
+          const r = String(body?.kind) === 'oauth_credential'
+            ? await createOAuthCredential(E, d, userId, (() => { try { return JSON.parse(String(body?.value ?? '')); } catch { return {}; } })(), userId)
+            : await createVaultEntry(E, d, userId, body, userId);
+          if ((r as any).error) return c.json({ error: (r as any).error }, 400);
+          return c.json({ entry: vaultOut(r) }, 201);
+        },
+      } as any),
+      registerApiRoute('/vault/:id', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db();
+          await ready;
+          const entry = await getVaultEntry(d, u.id, String(c.req.param('id') ?? ''));
+          return entry ? c.json({ entry: vaultOut(entry) }) : c.json({ error: 'not found' }, 404);
+        },
+      } as any),
+      registerApiRoute('/vault/:id', {
+        method: 'DELETE',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          // 设备令牌路径（mcp-library S2.3）：桌面断开集成删凭证用（user_id='device'）
+          const device = !u && tokenOk(reqToken(c));
+          if (!u && !device) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db();
+          await ready;
+          const r = await deleteVaultEntry(E, d, u ? u.id : 'device', String(c.req.param('id') ?? ''));
+          return c.json(r, r.ok ? 200 : 404);
+        },
+      } as any),
+      // 人格配置（S2.5）：登录可读写；persona 是数据不是代码
+      registerApiRoute('/settings/persona', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db();
+          await ready;
+          return c.json({ persona: await getPersona(d) });
+        },
+      } as any),
+      registerApiRoute('/settings/persona', {
+        method: 'PUT',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const { d, ready } = db();
+          await ready;
+          const persona = await updatePersona(d, body ?? {}, String(u.id));
+          await syncEngineCopy(persona);
+          return c.json({ persona });
+        },
+      } as any),
+      // L2 出站 PULL：原子领取一个 queued 任务 → working
+      registerApiRoute('/l2-claim', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          if (!tokenOk(reqToken(c))) return c.json({ error: 'bad token' }, 401);
+          const { d, ready } = db(); await ready;
+          const row: any = await d.prepare(`UPDATE l2_tasks SET state='working', updated_at=?
+            WHERE task_id=(SELECT task_id FROM l2_tasks WHERE state='queued' ORDER BY created_at LIMIT 1) AND state='queued'
+            RETURNING task_id, prompt, runtime, thread_id, kind, expert_id, instructions, resource_id, def_json, harness`).bind(Date.now()).first();
+          if (!row) return c.json({ task: null });
+          // 专家模型在 claim 时从 agent_defs 取（指令已随任务快照；模型改动对未领取任务即时生效）
+          let model: string | null = null;
+          if (row.expert_id) {
+            try { model = ((await d.prepare('SELECT model FROM agent_defs WHERE id=?').bind(row.expert_id).first()) as any)?.model ?? null; } catch {}
+          }
+          let def: any = null;
+          try { def = row.def_json ? JSON.parse(row.def_json) : null; } catch {}
+          console.log('[L1] claimed', JSON.stringify({ taskId: row.task_id, kind: row.kind ?? 'sandbox' }));
+          return c.json({ task: {
+            taskId: row.task_id, prompt: row.prompt ?? '', runtime: row.runtime ?? 'cloud', threadId: row.thread_id,
+            kind: row.kind ?? 'sandbox', expertId: row.expert_id ?? null, instructions: row.instructions ?? null,
+            resourceId: row.resource_id ?? null, model, def, harness: row.harness ?? null,
+          } });
+        },
+      } as any),
+      // L2 取秘钥（secret-pipeline）：设备令牌 + 任务授权（ref 必须出现在该任务的 def 快照里）→ 运行时 env 读回明文。
+      // 明文只进响应体；不进日志/模型上下文/快照。
+      registerApiRoute('/l2-secret', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          if (!tokenOk(reqToken(c))) return c.json({ error: 'bad token' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const ref = String(body?.ref ?? '').replace(/^secret:/, '');
+          if (!/^vault-[\w-]+$/.test(ref)) return c.json({ error: 'bad payload' }, 400);
+          const { d, ready } = db(); await ready;
+          const meta: any = await d.prepare('SELECT name, kind FROM vault_meta WHERE id=?').bind(ref).first();
+          if (!meta) return c.json({ error: 'secret not found or expired' }, 404);
+          // 用户级凭证（mcp-library S2.2/S2.5 授权面签字）：kind=oauth_credential|api_key 是「已连接集成」的
+          // 设备级凭证——连接写入与取用同界（设备令牌），不走任务 blob 校验（ref 在本机注册表而非任务文本）。
+          // 签字：设备令牌泄露即可取已连集成的短命令牌——与「L2 本就要拿这些令牌调 MCP」同界，属固有暴露面。
+          // 任务级秘钥（generic，HITL request_secret）维持任务 blob 校验不变。
+          const deviceScoped = String(meta.kind) === 'oauth_credential' || String(meta.kind) === 'api_key';
+          if (deviceScoped) {
+            if (String(meta.kind) === 'oauth_credential') {
+              const got = await getOAuthAccessToken(E, d, ref);
+              if ((got as any).error) return c.json({ error: (got as any).error }, 404);
+              return c.json({ value: (got as any).value, name: meta?.name ?? null });
+            }
+            const got = await getVaultValue(E, d, ref);
+            if (!got) return c.json({ error: 'secret not found or expired' }, 404);
+            return c.json({ value: got.value, name: meta?.name ?? null });
+          }
+          const taskId = String(body?.taskId ?? '');
+          if (!taskId) return c.json({ error: 'bad payload' }, 400);
+          const task: any = await d.prepare('SELECT def_json, instructions, prompt FROM l2_tasks WHERE task_id=?').bind(taskId).first();
+          if (!task) return c.json({ error: 'task not found' }, 404);
+          // 授权面：句柄必须出现在该任务的 def 快照 / 指令 / prompt（request_secret 流把句柄写进 prompt）
+          const blob = `${task.def_json ?? ''}\n${task.instructions ?? ''}\n${task.prompt ?? ''}`;
+          if (!blob.includes(ref)) return c.json({ error: 'ref not authorized for this task' }, 403);
+          const got = await getVaultValue(E, d, ref);
+          if (!got) return c.json({ error: 'secret not found or expired' }, 404);
+          return c.json({ value: got.value, name: meta?.name ?? null });
+        },
+      } as any),
+      // A2A push webhook（L2 → L1）。真实路径：/a2a-callback（无 /api 前缀）
+      registerApiRoute('/a2a-callback', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          if (!tokenOk(reqToken(c))) { console.log('[L1] callback REJECTED bad token'); return c.json({ error: 'bad token' }, 401); }
+          const task: any = await c.req.json().catch(() => null);
+          if (!task?.id || !task?.status?.state) return c.json({ error: 'bad payload' }, 400);
+          const { state, text } = extractTask(task);
+          const f = await finalizeTask(String(task.id), state, text, 'callback');
+          if (f.ignored) return c.json({ ok: true, ignored: f.ignored });
+          if (f.compose) { try { c.executionCtx.waitUntil(f.compose); } catch { await f.compose; } }
+          return c.json({ ok: true });
+        },
+      } as any),
+      // 前端轮询：本 thread 已完成且未投递的后台结果（reply 优先，否则原始 result）
+      // L2 一句话进度（l2-progress S2.1，Grok 语感）：设备令牌 + 任务非终态；15s 去重、cap 20；入房 + RoomDO
+      registerApiRoute('/l2-progress', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          if (!tokenOk(reqToken(c))) return c.json({ error: 'bad token' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const taskId = String(body?.taskId ?? '');
+          const kind = String(body?.kind ?? 'note');
+          const line = String(body?.line ?? '').trim().slice(0, 120);
+          if (!taskId || !line) return c.json({ error: 'bad payload' }, 400);
+          const { d, ready } = db(); await ready;
+          const task: any = await d.prepare('SELECT thread_id, state, progress FROM l2_tasks WHERE task_id=?').bind(taskId).first();
+          if (!task) return c.json({ error: 'task not found' }, 404);
+          if (TERMINAL.includes(String(task.state))) return c.json({ ok: true, stale: true });
+          if (String(task.state) !== 'working') return c.json({ error: 'task not claimed' }, 409);
+          const now = Date.now();
+          let arr: any[] = [];
+          try { arr = task.progress ? JSON.parse(task.progress) : []; } catch {}
+          const last = arr[arr.length - 1];
+          if (last && now - Number(last.at) < 15_000) return c.json({ ok: true, deduped: true });
+          arr.push({ line, at: now, kind });
+          if (arr.length > 20) arr = arr.slice(-20);
+          await d.prepare('UPDATE l2_tasks SET progress=? WHERE task_id=?').bind(JSON.stringify(arr), taskId).run();
+          // 节流（S2.2）：非心跳播报每 task 最多 10 条入房；心跳也播报但受 15s 去重约束
+          const spoken = arr.filter((p: any) => p.kind !== 'heartbeat').length;
+          if (kind === 'heartbeat' || spoken <= 10) {
+            const clean = sanitizeProgress(line);
+            const msgId = `msg-${crypto.randomUUID()}`;
+            try {
+              await d.prepare('INSERT INTO messages (id,room_id,user_id,role,content,created_at) VALUES (?,?,?,?,?,?)')
+                .bind(msgId, task.thread_id, null, 'assistant', clean, now).run();
+              // 复用 message 事件（评审 CRITICAL）：RoomDO/前端只认 message|busy，progress kind 会被静默丢弃
+              await notifyRoom(task.thread_id, { kind: 'message', messageId: msgId });
+            } catch (e: any) {
+              console.log('[L1] progress room write failed', String(e?.message ?? e).slice(0, 120));
+            }
+          }
+          return c.json({ ok: true });
+        },
+      } as any),
+      // judgment call 追问（ask-artifacts S2.1）：专家提问 → 房间问句 → 主人回复即答案
+      // harness 默认选择存档（harness-registry S2.3）：桌面端设默认后上报；派发可参考
+      registerApiRoute('/harness-settings', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const { d, ready } = db(); await ready;
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (u) {
+            const row: any = await d.prepare('SELECT harness FROM user_settings WHERE user_id=?').bind(u.id).first();
+            return c.json({ harness: row?.harness ?? null });
+          }
+          if (tokenOk(reqToken(c))) {
+            const row: any = await d.prepare("SELECT value FROM device_defaults WHERE key='harness'").first();
+            return c.json({ harness: row?.value ?? null });
+          }
+          return c.json({ error: 'unauthorized' }, 401);
+        },
+      } as any),
+      registerApiRoute('/harness-settings', {
+        method: 'PUT',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const body: any = await c.req.json().catch(() => ({}));
+          const harness = String(body?.harness ?? '').trim().slice(0, 40) || null;
+          // id 格式校验（≤40，安全字符集）；自定义目录项（本机 ~/.config/mastra-l2/harnesses.json）也允许——
+          // 具体是否可用由 L2 resolveHarness 按合并目录裁决（评审 MINOR：不许任意字符串入库）
+          if (harness && !isValidHarnessId(harness)) {
+            return c.json({ error: 'invalid harness id' }, 400);
+          }
+          const { d, ready } = db(); await ready;
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (u) {
+            await d.prepare(`INSERT INTO user_settings (user_id, harness, updated_at) VALUES (?,?,?)
+              ON CONFLICT(user_id) DO UPDATE SET harness=excluded.harness, updated_at=excluded.updated_at`)
+              .bind(u.id, harness, Date.now()).run();
+            return c.json({ harness });
+          }
+          if (tokenOk(reqToken(c))) {
+            // 设备令牌路径（评审 MAJOR）：桌面端上报设备默认
+            await d.prepare(`INSERT INTO device_defaults (key, value, updated_at) VALUES ('harness',?,?)
+              ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`)
+              .bind(harness, Date.now()).run();
+            return c.json({ harness });
+          }
+          return c.json({ error: 'unauthorized' }, 401);
+        },
+      } as any),
+      // ---------- Web MCP 管理（web-mcp S2.1）：市场目录 / 我的连接 / OAuth 回调 ----------
+      registerApiRoute('/mcp-catalog', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const entries = (mcpCatalogJson as any).entries ?? [];
+          return c.json({ ok: true, entries });
+        },
+      } as any),
+      registerApiRoute('/mcp-connections', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          const device = !u && tokenOk(reqToken(c));
+          if (!u && !device) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db(); await ready;
+          // 设备令牌取全部连接（设备级根信任，与 /l2-secret 设备级凭证同界）；会话只取本人
+          const rows = u ? await listConnections(d, u.id) : await listConnections(d, null);
+          return c.json({ ok: true, connections: rows.map(connOut) });
+        },
+      } as any),
+      registerApiRoute('/mcp-connections/:id', {
+        method: 'DELETE',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db(); await ready;
+          const r = await deleteConnection(E, d, u.id, String(c.req.param('id') ?? ''));
+          return c.json(r, r.ok ? 200 : 404);
+        },
+      } as any),
+      registerApiRoute('/mcp-connections/key', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const catalogId = String(body?.catalogId ?? '');
+          const key = String(body?.key ?? '');
+          const entry = (mcpCatalogJson as any).entries?.find((e: any) => e.id === catalogId);
+          if (!entry || entry.auth?.type !== 'api_key') return c.json({ error: 'not an api_key integration' }, 400);
+          if (!key) return c.json({ error: 'key required' }, 400);
+          const { d, ready } = db(); await ready;
+          const stored = await storeApiKey(E, d, u.id, key, `${entry.name}-key`, u.id);
+          if ((stored as any).error) return c.json({ error: (stored as any).error }, 400);
+          const def = managedRegistryEntry(entry, String((stored as any).id), entry.name, null);
+          const conn = await upsertConnection(d, u.id, { catalogId, name: entry.name, transport: def, vaultId: String((stored as any).id), account: null });
+          return c.json({ ok: true, connection: connOut(conn) }, 201);
+        },
+      } as any),
+      registerApiRoute('/mcp-connections/none', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const catalogId = String(body?.catalogId ?? '');
+          const entry = (mcpCatalogJson as any).entries?.find((e: any) => e.id === catalogId);
+          if (!entry || entry.auth?.type !== 'none') return c.json({ error: 'not a no-auth integration' }, 400);
+          const { d, ready } = db(); await ready;
+          const def = managedRegistryEntry(entry, '', entry.name, null);
+          const conn = await upsertConnection(d, u.id, { catalogId, name: entry.name, transport: def, vaultId: null, account: null });
+          return c.json({ ok: true, connection: connOut(conn) }, 201);
+        },
+      } as any),
+      registerApiRoute('/mcp-oauth/start', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const catalogId = String(body?.catalogId ?? '');
+          const entry = (mcpCatalogJson as any).entries?.find((e: any) => e.id === catalogId);
+          if (!entry || entry.auth?.type !== 'oauth2') return c.json({ error: 'not an oauth2 integration' }, 400);
+          const { d, ready } = db(); await ready;
+          // BYO OAuth client（Google 等）：body 传入或用上次记住的。client_secret 只入 vault（评审 MAJOR：
+          // 不落 D1 明文），user_settings.oauth_clients 记 {clientId, secretRef}
+          let clientId = String(body?.clientId ?? '').trim();
+          let clientSecret = String(body?.clientSecret ?? '').trim();
+          let secretRef: string | null = null;
+          if (!clientId) {
+            try {
+              const row: any = await d.prepare('SELECT oauth_clients FROM user_settings WHERE user_id=?').bind(u.id).first();
+              const saved = JSON.parse(String(row?.oauth_clients ?? '{}'))?.[String(entry.auth.provider)];
+              clientId = String(saved?.clientId ?? '');
+              secretRef = saved?.secretRef ? String(saved.secretRef) : null;
+            } catch { /* 无记住的 client */ }
+          }
+          if (!clientId) return c.json({ error: 'missing_client', hint: `请提供 ${entry.auth.provider} 的 OAuth client（client_id/client_secret）` }, 400);
+          if (clientSecret) {
+            const stored = await storeApiKey(E, d, u.id, clientSecret, `${entry.auth.provider ?? 'oauth'}-client-secret`, u.id);
+            if (!(stored as any).error) secretRef = String((stored as any).id);
+          }
+          if (body?.clientId) {
+            try {
+              const row: any = await d.prepare('SELECT oauth_clients FROM user_settings WHERE user_id=?').bind(u.id).first();
+              const saved = JSON.parse(String(row?.oauth_clients ?? '{}') || '{}');
+              saved[String(entry.auth.provider)] = { clientId, secretRef };
+              await d.prepare(`INSERT INTO user_settings (user_id, oauth_clients, updated_at) VALUES (?,?,?)
+                ON CONFLICT(user_id) DO UPDATE SET oauth_clients=excluded.oauth_clients, updated_at=excluded.updated_at`)
+                .bind(u.id, JSON.stringify(saved), Date.now()).run();
+            } catch { /* 记不住不影响本次 */ }
+          }
+          const pkce = await genPkceWeb();
+          const redirectUri = `${publicBase()}/oauth/callback`;
+          await saveOAuthState(d, {
+            state: pkce.state, user_id: u.id, catalog_id: catalogId,
+            client_id: clientId, client_secret: secretRef,
+            code_verifier: pkce.verifier, redirect_back: safeRedirectBack(body?.redirectBack), created_at: Date.now(),
+          });
+          const authUrl = buildAuthUrlWeb(entry.auth, clientId, redirectUri, pkce);
+          return c.json({ ok: true, authUrl, provider: entry.auth.provider ?? null });
+        },
+      } as any),
+      registerApiRoute('/oauth/callback', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const code = String(c.req.query('code') ?? '');
+          const state = String(c.req.query('state') ?? '');
+          const { d, ready } = db(); await ready;
+          const st = await takeOAuthState(d, state);
+          if (!st) return c.redirect('/?mcp=error&reason=state', 302);
+          const entry = (mcpCatalogJson as any).entries?.find((e: any) => e.id === st.catalog_id);
+          if (!entry?.auth?.tokenUrl) return c.redirect('/?mcp=error&reason=catalog', 302);
+          try {
+            const params = new URLSearchParams({
+              grant_type: 'authorization_code', code,
+              redirect_uri: `${publicBase()}/oauth/callback`,
+              client_id: st.client_id, code_verifier: st.code_verifier,
+            });
+            // state 里存的是 vault 引用；换令牌时服务端解出明文（不出库）
+            let clientSecretPlain = '';
+            if (st.client_secret) {
+              clientSecretPlain = String(st.client_secret).startsWith('vault-')
+                ? String((await getVaultValue(E, d, String(st.client_secret)))?.value ?? '')
+                : String(st.client_secret);
+              if (clientSecretPlain) params.set('client_secret', clientSecretPlain);
+            }
+            const res = await fetch(String(entry.auth.tokenUrl), {
+              method: 'POST',
+              headers: { 'content-type': 'application/x-www-form-urlencoded' },
+              body: params.toString(),
+              signal: AbortSignal.timeout(15000),
+            });
+            const tok: any = await res.json().catch(() => ({}));
+            if (!res.ok || !tok?.access_token) return c.redirect('/?mcp=error&reason=token', 302);
+            // id_token 仅解码取 email 展示（不验签）
+            let account: string | undefined;
+            try {
+              const payload = JSON.parse(atob(String(tok.id_token ?? '').split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+              account = typeof payload.email === 'string' ? payload.email : undefined;
+            } catch { /* 无 id_token */ }
+            const stored = await storeOAuthCredential(E, d, st.user_id, {
+              access_token: String(tok.access_token),
+              refresh_token: tok.refresh_token ? String(tok.refresh_token) : undefined,
+              expires_at: tok.expires_in ? Date.now() + Number(tok.expires_in) * 1000 : undefined,
+              client_id: st.client_id,
+              client_secret: clientSecretPlain || undefined,
+              token_url: String(entry.auth.tokenUrl),
+              scopes: entry.auth.scopes,
+              account,
+            }, st.user_id);
+            if ((stored as any).error) return c.redirect('/?mcp=error&reason=vault', 302);
+            const def = managedRegistryEntry(entry, String((stored as any).id), entry.name, account ?? null);
+            await upsertConnection(d, st.user_id, { catalogId: st.catalog_id, name: entry.name, transport: def, vaultId: String((stored as any).id), account: account ?? null });
+            const back = safeRedirectBack(st.redirect_back);
+            const sep = back.includes('?') ? '&' : '?';
+            return c.redirect(`${back}${sep}mcp=connected&name=${encodeURIComponent(entry.name)}&account=${encodeURIComponent(account ?? '')}`, 302);
+          } catch (e: any) {
+            console.error('[oauth-callback]', String(e?.message ?? e).slice(0, 300));
+            return c.redirect('/?mcp=error&reason=exchange', 302);
+          }
+        },
+      } as any),
+      registerApiRoute('/l2-ask', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          if (!tokenOk(reqToken(c))) return c.json({ error: 'bad token' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const taskId = String(body?.taskId ?? '');
+          const question = String(body?.question ?? '').trim().slice(0, 300);
+          if (!taskId || !question) return c.json({ error: 'bad payload' }, 400);
+          const { d, ready } = db(); await ready;
+          const task: any = await d.prepare('SELECT thread_id, state, ask_question, ask_answer, ask_count FROM l2_tasks WHERE task_id=?').bind(taskId).first();
+          if (!task) return c.json({ error: 'task not found' }, 404);
+          if (TERMINAL.includes(String(task.state))) return c.json({ error: 'task finished' }, 409);
+          if (String(task.state) !== 'working') return c.json({ error: 'task not claimed' }, 409);
+          const now = Date.now();
+          // CAS（评审 MAJOR/MINOR）：仅当无 pending 且计数 <3 时落库，防并发覆盖/超限
+          const upd: any = await d.prepare(`UPDATE l2_tasks SET ask_question=?, ask_answer=NULL, ask_count=COALESCE(ask_count,0)+1
+            WHERE task_id=? AND (ask_question IS NULL OR ask_answer IS NOT NULL) AND COALESCE(ask_count,0)<3`)
+            .bind(question, taskId).run();
+          if (!upd?.meta?.changes) {
+            const cur: any = await d.prepare('SELECT ask_question, ask_answer, ask_count FROM l2_tasks WHERE task_id=?').bind(taskId).first();
+            if (Number(cur?.ask_count ?? 0) >= 3) return c.json({ error: 'ask limit reached (3)' }, 429);
+            return c.json({ error: 'question already pending' }, 409);
+          }
+          const clean = sanitizeProgress(question);
+          const msgId = `msg-${crypto.randomUUID()}`;
+          try {
+            await d.prepare('INSERT INTO messages (id,room_id,user_id,role,content,created_at) VALUES (?,?,?,?,?,?)')
+              .bind(msgId, task.thread_id, null, 'assistant', `想请你定一下：${clean}`, now).run();
+            await notifyRoom(task.thread_id, { kind: 'message', messageId: msgId });
+          } catch (e: any) {
+            console.log('[L1] ask room write failed', String(e?.message ?? e).slice(0, 120));
+          }
+          return c.json({ ok: true });
+        },
+      } as any),
+      registerApiRoute('/l2-ask-cancel', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          if (!tokenOk(reqToken(c))) return c.json({ error: 'bad token' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const taskId = String(body?.taskId ?? '');
+          const { d, ready } = db(); await ready;
+          await d.prepare('UPDATE l2_tasks SET ask_question=NULL WHERE task_id=? AND ask_answer IS NULL').bind(taskId).run();
+          return c.json({ ok: true });
+        },
+      } as any),
+      registerApiRoute('/l2-ask-answer', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          if (!tokenOk(reqToken(c))) return c.json({ error: 'bad token' }, 401);
+          const taskId = c.req.query('taskId') ?? '';
+          const { d, ready } = db(); await ready;
+          const task: any = await d.prepare('SELECT ask_answer FROM l2_tasks WHERE task_id=?').bind(taskId).first();
+          if (!task) return c.json({ error: 'task not found' }, 404);
+          return c.json({ answer: task.ask_answer ?? null });
+        },
+      } as any),
+      // 产物预览（ask-artifacts S2.2）：图片/文本产物落库，房间附件呈现
+      registerApiRoute('/l2-artifact', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          if (!tokenOk(reqToken(c))) return c.json({ error: 'bad token' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const taskId = String(body?.taskId ?? '');
+          const kind = String(body?.kind ?? 'text');
+          const caption = sanitizeProgress(String(body?.caption ?? '').slice(0, 120));
+          let data = String(body?.data ?? '');
+          if (kind === 'text') data = sanitizeProgress(data).slice(0, 8_000);
+          if (!taskId || !['image', 'text', 'page'].includes(kind) || !data) return c.json({ error: 'bad payload' }, 400);
+          if (kind === 'image' && data.length > 1_600_000) return c.json({ error: 'image too large (>1.2MB)' }, 413);
+          if (kind === 'text' && data.length > 8_000) return c.json({ error: 'text too large' }, 413);
+          if (kind === 'page' && data.length > 2_000_000) return c.json({ error: 'page too large (>2MB)' }, 413);
+          const { d, ready } = db(); await ready;
+          const task: any = await d.prepare('SELECT thread_id, state FROM l2_tasks WHERE task_id=?').bind(taskId).first();
+          if (!task) return c.json({ error: 'task not found' }, 404);
+          if (TERMINAL.includes(String(task.state))) return c.json({ error: 'task finished' }, 409);
+          const id = `art-${crypto.randomUUID()}`;
+          await d.prepare('INSERT INTO task_artifacts (id,task_id,kind,caption,data,created_at) VALUES (?,?,?,?,?,?)')
+            .bind(id, taskId, kind, caption || null, data, Date.now()).run();
+          const msgId = `msg-${crypto.randomUUID()}`;
+          try {
+            // page：发布到 CF Pages 拿独立可分享 URL（pages-hosting S2.2 通道 A），房间消息用 [page:id]
+            if (kind === 'page') {
+              const pub = await publishPage(E as any, { html: data, title: caption || '页面', taskId, roomId: task.thread_id, userId: null });
+              await d.prepare('INSERT INTO messages (id,room_id,user_id,role,content,created_at) VALUES (?,?,?,?,?,?)')
+                .bind(msgId, task.thread_id, null, 'assistant',
+                  pub ? `[page:${pub.id}] ${caption || '页面'}｜${pub.url}` : `[artifact:${id}] ${caption || '页面'}（发布失败，仅存档）`, Date.now()).run();
+            } else {
+              await d.prepare('INSERT INTO messages (id,room_id,user_id,role,content,created_at) VALUES (?,?,?,?,?,?)')
+                .bind(msgId, task.thread_id, null, 'assistant',
+                  kind === 'text'
+                    ? `[artifact:${id}] ${caption || '产物'}｜${sanitizeProgress(data).slice(0, 300)}`
+                    : `[artifact:${id}] ${caption || '屏幕截图'}`, Date.now()).run();
+            }
+            await notifyRoom(task.thread_id, { kind: 'message', messageId: msgId });
+          } catch (e: any) {
+            console.log('[L1] artifact room write failed', String(e?.message ?? e).slice(0, 120));
+          }
+          return c.json({ ok: true, id });
+        },
+      } as any),
+      registerApiRoute('/artifacts/:id', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db(); await ready;
+          const row: any = await d.prepare('SELECT kind, caption, data FROM task_artifacts WHERE id=?').bind(String(c.req.param('id') ?? '')).first();
+          if (!row) return c.json({ error: 'not found' }, 404);
+          if (row.kind === 'image') {
+            const b64 = String(row.data).replace(/^data:image\/\w+;base64,/, '');
+            return new Response(Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0)), {
+              headers: { 'content-type': 'image/png', 'cache-control': 'private, max-age=3600' },
+            });
+          }
+          return c.json({ caption: row.caption, text: row.data });
+        },
+      } as any),
+      // Pages 托管（pages-hosting S2.3）：取页 / 下架
+      registerApiRoute('/quota', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db(); await ready;
+          return c.json({ quota: await getQuota(d, u.id) });
+        },
+      } as any),
+      // 订阅与收款（saas S2.5）：Paddle webhook / 结账 / 订阅查询
+      registerApiRoute('/webhooks/paddle', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const raw = await c.req.text();
+          const sig = c.req.header('paddle-signature') ?? '';
+          const secret = String((E as any).PADDLE_WEBHOOK_SECRET ?? '');
+          if (!secret || !(await verifyPaddleSignature(raw, sig, secret))) return c.json({ error: 'bad signature' }, 401);
+          let ev: any = {};
+          try { ev = JSON.parse(raw); } catch { return c.json({ error: 'bad json' }, 400); }
+          const { d, ready } = db(); await ready;
+          const res = await handlePaddleEvent({ ...(E as any), DB: d }, ev);
+          return c.json(res);
+        },
+      } as any),
+      registerApiRoute('/billing/checkout', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const priceKey = String(body?.priceKey ?? '');
+          if (!/^(lite|pro|max|credit_1000|cloud_60)$/.test(priceKey)) return c.json({ error: 'bad priceKey' }, 400);
+          const { d, ready } = db(); await ready;
+          const r = await createCheckout({ ...(E as any), DB: d }, u.id, priceKey, u.email);
+          return c.json(r);
+        },
+      } as any),
+      registerApiRoute('/billing/subscription', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db(); await ready;
+          return c.json({ subscription: await getSubscription(d, u.id) });
+        },
+      } as any),
+      registerApiRoute('/pages/:id', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db(); await ready;
+          const row = await getPage(d, String(c.req.param('id') ?? ''));
+          if (!row) return c.json({ error: 'not found' }, 404);
+          return c.json({ page: { id: row.id, title: row.title, url: row.url, status: row.status, created_by: row.created_by, created_at: row.created_at } });
+        },
+      } as any),
+      registerApiRoute('/pages/:id/unpublish', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db(); await ready;
+          const row = await getPage(d, String(c.req.param('id') ?? ''));
+          if (!row) return c.json({ error: 'not found' }, 404);
+          if (row.created_by && row.created_by !== u.id) return c.json({ error: 'not owner' }, 403);
+          const ok = await unpublishPage(E as any, row.id);
+          return c.json({ ok });
+        },
+      } as any),
+      registerApiRoute('/l2-results', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const thread = c.req.query('thread') ?? '';
+          if (!/^[\w-]{3,64}$/.test(thread)) return c.json({ error: 'bad thread' }, 400);
+          const { d, ready } = db(); await ready;
+          const mem: any = await d.prepare('SELECT 1 AS x FROM room_members WHERE room_id=? AND user_id=?').bind(thread, u.id).first();
+          if (!mem) return c.json({ error: 'forbidden' }, 403);
+          const { results } = await d.prepare('SELECT task_id,state,result,reply,progress,updated_at FROM l2_tasks WHERE thread_id=? AND delivered=0 ORDER BY created_at').bind(thread).all();
+          const busy = results.some((r: any) => !TERMINAL.includes(r.state));
+          const done = results.filter((r: any) => TERMINAL.includes(r.state) && (r.reply || Date.now() - r.updated_at > 60_000));
+          for (const r of done as any[]) await d.prepare('UPDATE l2_tasks SET delivered=1 WHERE task_id=?').bind(r.task_id).run();
+          const out: any[] = [];
+          for (const r of done as any[]) {
+            const arts = (await d.prepare('SELECT id, kind, caption FROM task_artifacts WHERE task_id=? ORDER BY created_at').bind(r.task_id).all()).results ?? [];
+            out.push({
+              state: r.state,
+              text: r.reply || (r.state === 'completed' ? `处理好了：${r.result ?? ''}` : '这次后台处理没成功，请稍后再试。'),
+              progress: (() => { try { return r.progress ? JSON.parse(r.progress) : []; } catch { return []; } })(),
+              artifacts: arts,
+            });
+          }
+          return c.json({ busy, results: out });
+        },
+      } as any),
+      // rooms / messages / better-auth（多用户共享房间 + 邮箱密码登录）
+      ...roomHandlers({
+        E: E as any,
+        memory: memoryRef,
+        chat: {
+          stream: async (messages, opts) => {
+            // judgment call 路由（ask-artifacts S2.1）：thread 有未答提问时，用户消息即答案，回轻 ack 不走全量回复
+            const threadId = String((opts as any)?.memory?.thread ?? '');
+            try {
+              const { d, ready } = db(); await ready;
+              // 最老的未答提问优先（FIFO）：多任务同房间时答案不被最新提问抢走（评审 MAJOR）
+              const t: any = threadId ? await d.prepare('SELECT task_id, ask_question FROM l2_tasks WHERE thread_id=? AND ask_question IS NOT NULL AND ask_answer IS NULL AND state=? ORDER BY created_at ASC LIMIT 1').bind(threadId, 'working').first() : null;
+              if (t?.task_id) {
+                const lastUser = [...(messages as any[])].reverse().find((m: any) => (m?.role ?? m?.content?.role) === 'user');
+                const raw = String((lastUser as any)?.content ?? (lastUser as any)?.text ?? '').trim();
+                // sendMessage 会包一层【发言者】前缀——答案剥掉
+                const answer = raw.replace(/^【[^】]*】\s*/, '').slice(0, 2000);
+                if (answer) {
+                  await d.prepare('UPDATE l2_tasks SET ask_answer=? WHERE task_id=? AND ask_answer IS NULL').bind(answer, t.task_id).run();
+                  const ack = `收到你的答复（针对：${sanitizeProgress(String(t.ask_question).slice(0, 40))}），已转给任务继续。`;
+                  const stream = new ReadableStream<string>({
+                    start(controller) { controller.enqueue(ack); controller.close(); },
+                  });
+                  return { textStream: stream } as any;
+                }
+              }
+            } catch (e: any) { console.log('[L1] ask-route failed, fallback chat', String(e?.message ?? e).slice(0, 120)); }
+            ensureOmInstalled();
+            await syncEngineCopy();
+            // 提示词装配（S2.3）：基座+身份走 Agent.instructions；语调+画像走消息级 system 前置。
+            const msgs = await withThreadBlock(messages as any[], String((opts as any)?.memory?.thread ?? '') || undefined);
+            const out = await orchestrator.stream(msgs, opts as any);
+            // OM 周期走队列（S2.8）：流结束只入队，queue consumer 独立 invocation 跑 Observer/Reflector。
+            // （fire-and-forget 在 Workers 会随响应结束被回收，实测观测永不落库。）
+            const src = (out as any).textStream as ReadableStream<string>;
+            const wrapped = src.pipeThrough(new TransformStream<string, string>({
+              flush() {
+                try {
+                  const threadId = String((opts as any)?.memory?.thread ?? '');
+                  const resourceId = String((opts as any)?.memory?.resource ?? '');
+                  if (threadId && E.OM_QUEUE?.send) {
+                    waitUntil(Promise.resolve(E.OM_QUEUE.send({ kind: 'observe', threadId, resourceId })).catch((e: any) => {
+                      console.log('[OM] enqueue failed', String(e?.message ?? e).slice(0, 120));
+                    }));
+                  }
+                } catch {}
+              },
+            }));
+            return { textStream: wrapped };
+          },
+        },
+        // 闹钟语义：唤醒对应房间的 RoomDO，推送内容由 DO 读 D1（S2.3）
+        notifyRoom,
+      }).map((h) => registerApiRoute(h.path as any, { method: h.method, requiresAuth: h.requiresAuth, handler: h.handler } as any)),
+    ],
+  },
+});
+
+// OM 周期消费者（S2.8）：队列独立 invocation 跑 Observer/Reflector，自带重试/DLQ。
+// mastra build 只保留 mastra/default 导出，queue 出口由 worker-entry 经 globalThis 注册表转发。
+const omQueueHandler = async (batch: any) => {
+  console.log('[OM] cycle batch', JSON.stringify({ n: batch?.messages?.length ?? 0, bodies: (batch?.messages ?? []).map((m: any) => m?.body) }));
+  for (const msg of batch?.messages ?? []) {
+    const body: any = msg?.body ?? {};
+    const threadId = String(body.threadId ?? '');
+    const resourceId = String(body.resourceId || (threadId ? `room:${threadId}` : ''));
+    if (!threadId) {
+      try { msg.ack(); } catch {}
+      continue;
+    }
+    try {
+      ensureOmInstalled();
+      await syncEngineCopy();
+      // 构建器把 new Mastra(...) 改写成惰性工厂，fetch 里才实例化；queue 调用必须自己触发，
+      // 否则 Memory 没注册、omEngine 解析为 null。
+      const m: any = mastra;
+      // 缓存 Mastra 实例：免费版 CPU 预算极小（约 10ms/次），每次重建整套 Mastra 太贵；
+      // 实例只用于把 storage 注册进 Memory，跨调用复用安全（memoryRef/orchestrator 本就是模块级单例）。
+      let _mastraInst: any = (globalThis as any).__omMastraInst;
+      if (!_mastraInst) {
+        _mastraInst = typeof m === 'function' ? m() : m;
+        (globalThis as any).__omMastraInst = _mastraInst;
+      }
+      const inst: any = _mastraInst;
+      // 注册是懒的（generate 的 memory 解析流程里才 setStorage）；queue 路径手动补：
+      // __registerMastra 只挂 mastra/logger，storage 要单独 setStorage，否则 omEngine 抛「requires a storage provider」。
+      try {
+        (memoryRef as any).__registerMastra?.(inst);
+        const st: any = inst?.getStorage?.();
+        if (st && !(memoryRef as any).hasOwnStorage) (memoryRef as any).setStorage?.(st);
+      } catch {}
+      const mem: any = memoryRef ?? (orchestrator as any).memory ?? inst?.getAgent?.('orchestrator')?.memory;
+      const engine = await mem?.omEngine;
+      if (!engine) {
+        let dom: any = null; let domErr = '';
+        try { dom = getStore().stores?.memory; } catch (e: any) { domErr = String(e?.message ?? e).slice(0, 80); }
+        throw new Error(`omEngine unavailable mem=${!!mem} mastraFn=${typeof m} dom=${!!dom} flag=${dom?.supportsObservationalMemory} domErr=${domErr}`);
+      }
+      if (body.kind === 'reflect' && typeof engine.reflect === 'function') {
+        // reflect 是位置参数（threadId, resourceId, prompt?），不是 opts 对象
+        await engine.reflect(threadId, resourceId);
+      } else {
+        const res: any = await engine.observe({ threadId, resourceId, force: true });
+        console.log('[OM] observe result', JSON.stringify(res ?? null).slice(0, 300));
+      }
+      try { await mem?.settled?.(); } catch {}
+      // 消息向量幂等索引（memory-recall-search S2.2）：OM 不做消息嵌入，自建补上
+      try {
+        const n = await indexThreadMessages({ store: getStore().stores?.memory, vector: vectorStore, aiBinding: () => E.AI, threadId, resourceId });
+        console.log('[OM] message-index', JSON.stringify({ threadId, n }));
+      } catch (e: any) {
+        console.log('[OM] message-index failed', String(e?.message ?? e).slice(0, 140));
+      }
+      console.log('[OM] cycle done', JSON.stringify({ kind: body.kind ?? 'observe', threadId }));
+      try { msg.ack(); } catch {}
+    } catch (e: any) {
+      console.log('[OM] cycle failed', JSON.stringify({ threadId, error: String(e?.message ?? e).slice(0, 160) }));
+      // omEngine 初始化失败会被缓存成拒绝态，清掉让下条消息重试
+      try { (memoryRef as any)._omEngine = null; (memoryRef as any)._omEngineInstance = null; } catch {}
+      try { msg.retry(); } catch {}
+    }
+  }
+};
+(globalThis as any).__omQueueHandler = omQueueHandler;
+
+// 定时任务执行（schedules-secrets S2.1）：Workers cron 每分钟 tick → 扫到期例程 →
+// 以 prompt 驱动秘书向目标房间发言（复用 compose 落消息 + RoomDO WS 通知）→ 记 runs、推 next_run_at。
+const computeNextRunAtSafe = async (rec: any, now: number): Promise<number> => {
+  try {
+    const v = computeNextRunAt(rec.cron, rec.timezone, now);
+    return v ?? now + 60_000;
+  } catch {
+    return now + 60_000;
+  }
+};
+
+const schedulesTick = async () => {
+  try {
+    ensureOmInstalled();
+    await syncEngineCopy();
+    // scheduled 路径不经过 fetch 的 mastra() 工厂——同队列消费者的接线：显式注册 Memory（否则 generate 抛 storage provider）
+    let inst0: any = (globalThis as any).__omMastraInst;
+    if (!inst0) {
+      const m0: any = mastra;
+      inst0 = typeof m0 === 'function' ? m0() : m0;
+      (globalThis as any).__omMastraInst = inst0;
+    }
+    try {
+      (memoryRef as any).__registerMastra?.(inst0);
+      const st0: any = inst0?.getStorage?.();
+      if (st0 && !(memoryRef as any).hasOwnStorage) (memoryRef as any).setStorage?.(st0);
+    } catch {}
+    const { d, ready } = db();
+    await ready;
+    try { await purgeExpiredVault(E, d); } catch {}
+    try { await purgeOAuthStates(d); } catch {}
+    const due = await dueSchedules(d, Date.now());
+    for (const rec of due as any[]) {
+      try {
+        // claim：先原子推走 next_run_at（防止慢回合 + 下一 tick 双发）
+        const claimed = await d.prepare('UPDATE schedules SET next_run_at=? WHERE id=? AND next_run_at=?')
+          .bind((await computeNextRunAtSafe(rec, Date.now())), rec.id, rec.next_run_at).run();
+        if (!claimed?.meta?.changes) continue;
+        try { await advanceSchedule(d, rec.id, Date.now()); } catch {}
+        const threadId = String(rec.target_id ?? '');
+        const prompt = `【定时任务：${rec.name}】${rec.prompt}`;
+        const msgs = await withThreadBlock([{ role: 'user', content: prompt }], threadId);
+        const schedRoom = await getRoomRow(d, threadId);
+        const res: any = await orchestrator.generate(msgs, {
+          memory: { thread: threadId, resource: schedRoom ? resourceFor(schedRoom) : `room:${threadId}` }, maxSteps: 1,
+        } as any);
+        const reply = String(res?.text ?? '').slice(0, 8000);
+        const content = reply || `定时任务「${rec.name}」执行完毕。`;
+        const msgId = `msg-${crypto.randomUUID()}`;
+        await d.prepare('INSERT INTO messages (id,room_id,user_id,role,content,created_at) VALUES (?,?,?,?,?,?)')
+          .bind(msgId, threadId, null, 'assistant', content, Date.now()).run();
+        await d.prepare('UPDATE rooms SET updated_at=? WHERE id=?').bind(Date.now(), threadId).run();
+        try { await notifyRoom(threadId, { kind: 'message', messageId: msgId }); } catch {}
+        await markRun(d, { scheduleId: rec.id, userId: rec.user_id, status: 'success', detail: content.slice(0, 200) });
+      } catch (e: any) {
+        try { await markRun(d, { scheduleId: rec.id, userId: rec.user_id, status: 'failed', detail: String(e?.message ?? e).slice(0, 200) }); } catch {}
+      }
+      try { await advanceSchedule(d, rec.id, Date.now()); } catch {}
+    }
+  } catch (e: any) {
+    console.log('[schedules] tick failed', String(e?.message ?? e).slice(0, 160));
+  }
+};
+(globalThis as any).__schedulesTick = schedulesTick;

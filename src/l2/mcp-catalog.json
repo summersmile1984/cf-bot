@@ -1,0 +1,213 @@
+{
+  "entries": [
+    {
+      "id": "google-gmail",
+      "name": "Gmail",
+      "vendor": "Google",
+      "category": "邮箱",
+      "description": "搜索/读取邮件线程、写草稿、打标签（Google Workspace 官方远端 MCP）",
+      "transport": {
+        "type": "remote",
+        "url": "https://gmailmcp.googleapis.com/mcp/v1"
+      },
+      "auth": {
+        "type": "oauth2",
+        "provider": "google",
+        "authorizationUrl": "https://accounts.google.com/o/oauth2/v2/auth",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "scopes": [
+          "https://www.googleapis.com/auth/gmail.readonly",
+          "https://www.googleapis.com/auth/gmail.compose"
+        ],
+        "extraAuthParams": {
+          "access_type": "offline",
+          "prompt": "consent"
+        }
+      },
+      "note": "Developer Preview：需在 Google Cloud 开启 Gmail MCP API；client_id 用户自带"
+    },
+    {
+      "id": "google-calendar",
+      "name": "Google 日历",
+      "vendor": "Google",
+      "category": "日程",
+      "description": "查/建/改日程、找空闲时间、回复邀请（官方远端 MCP）",
+      "transport": {
+        "type": "remote",
+        "url": "https://calendarmcp.googleapis.com/mcp/v1"
+      },
+      "auth": {
+        "type": "oauth2",
+        "provider": "google",
+        "authorizationUrl": "https://accounts.google.com/o/oauth2/v2/auth",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "scopes": [
+          "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+          "https://www.googleapis.com/auth/calendar.events.freebusy",
+          "https://www.googleapis.com/auth/calendar.events.readonly"
+        ],
+        "extraAuthParams": {
+          "access_type": "offline",
+          "prompt": "consent"
+        }
+      }
+    },
+    {
+      "id": "google-drive",
+      "name": "Google Drive",
+      "vendor": "Google",
+      "category": "云盘",
+      "description": "搜文件、读内容、上传/复制（官方远端 MCP）",
+      "transport": {
+        "type": "remote",
+        "url": "https://drivemcp.googleapis.com/mcp/v1"
+      },
+      "auth": {
+        "type": "oauth2",
+        "provider": "google",
+        "authorizationUrl": "https://accounts.google.com/o/oauth2/v2/auth",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "scopes": [
+          "https://www.googleapis.com/auth/drive.readonly",
+          "https://www.googleapis.com/auth/drive.file"
+        ],
+        "extraAuthParams": {
+          "access_type": "offline",
+          "prompt": "consent"
+        }
+      }
+    },
+    {
+      "id": "google-docs",
+      "name": "Google Docs",
+      "vendor": "Google",
+      "category": "文档",
+      "description": "读写 Google 文档（官方远端 MCP）",
+      "transport": {
+        "type": "remote",
+        "url": "https://docsmcp.googleapis.com/mcp/v1"
+      },
+      "auth": {
+        "type": "oauth2",
+        "provider": "google",
+        "authorizationUrl": "https://accounts.google.com/o/oauth2/v2/auth",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "scopes": [
+          "https://www.googleapis.com/auth/documents.readonly",
+          "https://www.googleapis.com/auth/documents"
+        ],
+        "extraAuthParams": {
+          "access_type": "offline",
+          "prompt": "consent"
+        }
+      }
+    },
+    {
+      "id": "google-sheets",
+      "name": "Google Sheets",
+      "vendor": "Google",
+      "category": "表格",
+      "description": "读写表格、改公式/行列（官方远端 MCP）",
+      "transport": {
+        "type": "remote",
+        "url": "https://sheetsmcp.googleapis.com/mcp/v1"
+      },
+      "auth": {
+        "type": "oauth2",
+        "provider": "google",
+        "authorizationUrl": "https://accounts.google.com/o/oauth2/v2/auth",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "scopes": [
+          "https://www.googleapis.com/auth/spreadsheets.readonly",
+          "https://www.googleapis.com/auth/spreadsheets"
+        ],
+        "extraAuthParams": {
+          "access_type": "offline",
+          "prompt": "consent"
+        }
+      }
+    },
+    {
+      "id": "google-slides",
+      "name": "Google Slides",
+      "vendor": "Google",
+      "category": "演示",
+      "description": "读写演示文稿（官方远端 MCP）",
+      "transport": {
+        "type": "remote",
+        "url": "https://slidesmcp.googleapis.com/mcp/v1"
+      },
+      "auth": {
+        "type": "oauth2",
+        "provider": "google",
+        "authorizationUrl": "https://accounts.google.com/o/oauth2/v2/auth",
+        "tokenUrl": "https://oauth2.googleapis.com/token",
+        "scopes": [
+          "https://www.googleapis.com/auth/presentations.readonly",
+          "https://www.googleapis.com/auth/presentations"
+        ],
+        "extraAuthParams": {
+          "access_type": "offline",
+          "prompt": "consent"
+        }
+      }
+    },
+    {
+      "id": "github",
+      "name": "GitHub",
+      "vendor": "GitHub",
+      "category": "研发",
+      "description": "仓库/Issue/PR 操作（官方 github-mcp-server，stdio）",
+      "transport": {
+        "type": "stdio",
+        "command": "npx",
+        "args": [
+          "-y",
+          "@modelcontextprotocol/server-github"
+        ]
+      },
+      "auth": {
+        "type": "api_key",
+        "apiKeyName": "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "apiKeyHint": "GitHub Personal Access Token（Settings → Developer settings → Tokens）"
+      }
+    },
+    {
+      "id": "filesystem",
+      "name": "本地文件",
+      "vendor": "Model Context Protocol",
+      "category": "工具",
+      "description": "读写本地文件/目录（官方 filesystem，stdio）",
+      "transport": {
+        "type": "stdio",
+        "command": "npx",
+        "args": [
+          "-y",
+          "@modelcontextprotocol/server-filesystem",
+          "~/"
+        ]
+      },
+      "auth": {
+        "type": "none"
+      }
+    },
+    {
+      "id": "memory",
+      "name": "记忆库",
+      "vendor": "Model Context Protocol",
+      "category": "工具",
+      "description": "知识图谱式记忆存取（官方 memory，stdio）",
+      "transport": {
+        "type": "stdio",
+        "command": "npx",
+        "args": [
+          "-y",
+          "@modelcontextprotocol/server-memory"
+        ]
+      },
+      "auth": {
+        "type": "none"
+      }
+    }
+  ]
+}

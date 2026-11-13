@@ -1,0 +1,60 @@
+{
+  "name": "mastra-two-layer-preflight",
+  "version": "0.2.15",
+  "private": false,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx --env-file-if-exists=.env src/server.ts",
+    "start": "tsx --env-file-if-exists=.env src/server.ts",
+    "smoke": "tsx --env-file-if-exists=.env scripts/smoke.ts",
+    "acp:probe": "tsx --env-file-if-exists=.env scripts/acp-probe.ts",
+    "start:all": "tsx --env-file-if-exists=.env src/server.ts",
+    "start:l1": "L2_A2A_URL=${L2_A2A_URL:-http://127.0.0.1:4121} tsx --env-file-if-exists=.env src/server.ts",
+    "start:l2-pull": "tsx --env-file-if-exists=.env src/l2-pull-worker.ts",
+    "start:l2": "tsx --env-file-if-exists=.env src/l2-server.ts",
+    "cf:deploy": "npm run cf:build && wrangler deploy -c .mastra/output/wrangler.json",
+    "cf:build": "npm run web:build && NODE_OPTIONS=--import=$PWD/scripts/cf-workers-stub.mjs mastra build && node scripts/cf-postbuild.mjs",
+    "cf:dev": "npm run cf:build && node scripts/cf-dev-vars.mjs && wrangler dev -c .mastra/output/wrangler.json --local --var PROBE_ROUTES:1",
+    "web:dev": "npm run dev --prefix apps/web",
+    "web:build": "npm run build --prefix apps/web",
+    "build": "npm run cf:build",
+    "deploy": "npm run cf:deploy"
+  },
+  "dependencies": {
+    "@ai-sdk/provider-v5": "npm:@ai-sdk/provider@2.0.3",
+    "@hono/node-server": "2.1.5",
+    "@mastra/acp": "^0.4.4",
+    "@mastra/cloudflare-d1": "^1.5.0",
+    "@mastra/core": "^1.81.0",
+    "@mastra/deployer-cloudflare": "^1.2.40",
+    "@mastra/libsql": "^1.28.0",
+    "@mastra/mcp": "^2.8.0",
+    "@mastra/memory": "^1.40.0",
+    "@mastra/server": "^1.81.0",
+    "better-auth": "^1.7.15",
+    "drizzle-orm": "^0.45.4",
+    "hono": "4.13.16",
+    "undici": "^7.30.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.0",
+    "mastra": "^1.37.0",
+    "tsx": "4.23.15",
+    "wrangler": "^4.156.0"
+  },
+  "license": "MIT",
+  "cloudflare": {
+    "bindings": {
+      "DEEPSEEK_API_KEY": {
+        "description": "DeepSeek API Key（模型网关，L1/L2 共用）。在 https://platform.deepseek.com 申请。"
+      },
+      "L1_PUBLIC_URL": {
+        "description": "部署完成后的公开地址（如 https://<你的名字>.workers.dev），用于回调链接；部署后可在 wrangler vars 里改。"
+      },
+      "CLOUDFLARE_API_KEY": {
+        "description": "可选：CF API Token（Vault 动态密钥功能用）；不配不影响主功能。"
+      }
+    }
+  }
+}

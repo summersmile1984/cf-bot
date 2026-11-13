@@ -1,0 +1,58 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Mastra Desktop",
+  "version": "0.2.2",
+  "identifier": "dev.summersmile.mastra-l2",
+  "build": {
+    "beforeDevCommand": "npm run ui:dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run sidecar:fetch && npm run ui:build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Mastra Desktop",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "externalBin": ["bin/cua"],
+    "resources": {
+      "../scripts/harness-cli.ts": "l2-pkg/scripts/harness-cli.ts",
+      "../../../src/l2/harness-registry.ts": "l2-pkg/scripts/harness-registry.ts",
+      "../../../src/l2/harnesses.json": "l2-pkg/scripts/harnesses.json",
+      "../scripts/mcp-cli.ts": "l2-pkg/scripts/mcp-cli.ts",
+      "../../../src/l2/mcp-registry.ts": "l2-pkg/scripts/mcp-registry.ts",
+      "../../../src/l2/mcp-test.ts": "l2-pkg/scripts/mcp-test.ts",
+      "../../../src/l2/mcp-catalog.ts": "l2-pkg/scripts/mcp-catalog.ts",
+      "../../../src/l2/mcp-catalog.json": "l2-pkg/scripts/mcp-catalog.json",
+      "../../../src/l2/oauth-flow.ts": "l2-pkg/scripts/oauth-flow.ts",
+      "../../../src/l2/secret-resolver.ts": "l2-pkg/scripts/secret-resolver.ts",
+      "../../../src/l2/proxy-fetch.ts": "l2-pkg/scripts/proxy-fetch.ts",
+      "../scripts/package.json": "l2-pkg/package.json"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    }
+  },
+  "plugins": {}
+}
