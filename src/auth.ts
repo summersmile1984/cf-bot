@@ -20,15 +20,17 @@ export type AuthEnv = {
 
 let cached: { key: string; auth: ReturnType<typeof betterAuth> } | null = null;
 
-export function getAuth(E: AuthEnv) {
-  const key = String(E.BETTER_AUTH_SECRET ?? '');
+export function getAuth(E: AuthEnv, requestOrigin?: string) {
+  // baseURL：显式配置优先，否则用请求来源自指（自部署无配置也能登录——按钮验证教训）
+  const baseURL = E.BETTER_AUTH_URL || E.L1_PUBLIC_URL || requestOrigin || 'http://localhost:8787';
+  const key = String(E.BETTER_AUTH_SECRET ?? '') + '|' + baseURL;
   if (cached && cached.key === key) return cached.auth;
   const db = drizzle(E.DB, { schema });
-  const baseURL = E.BETTER_AUTH_URL || E.L1_PUBLIC_URL || 'http://localhost:4120';
   const trusted = (E.BETTER_AUTH_TRUSTED_ORIGINS ?? '')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
+  if (requestOrigin && !trusted.includes(requestOrigin)) trusted.push(requestOrigin);
   const auth = betterAuth({
     database: drizzleAdapter(db, { provider: 'sqlite', schema, usePlural: false }),
     emailAndPassword: { enabled: true, minPasswordLength: 8 },
@@ -77,7 +79,9 @@ export async function getSessionUser(req: Request | { headers?: any; header?: (n
     if (tok && E.PUSH_TOKEN && tok === E.PUSH_TOKEN) return { id: 'dev-user', email: 'dev@local', name: 'DEV' };
   }
   try {
-    const auth = getAuth(E);
+    let origin: string | undefined;
+    try { if (req instanceof Request) origin = new URL(req.url).origin; } catch {}
+    const auth = getAuth(E, origin);
     // disableRefresh：读路径不走会话滚动续期（updateSession 写），否则并发读会竞态
     // 抛 FAILED_TO_GET_SESSION（401）——实测 8 并发 6 失败；读接口无需续期
     const s: any = await (auth.api as any).getSession({ headers, query: { disableRefresh: true } });

@@ -409,6 +409,8 @@ export function roomHandlers(deps: RoomDeps) {
       requiresAuth: false,
       handler: async (c: any) => {
         const req: Request = c.req.raw ?? c.req;
+        let origin: string | undefined;
+        try { origin = new URL(req.url).origin; } catch {}
         try {
           const url = new URL(req.url);
           if (req.method === 'POST' && url.pathname.includes('/sign-up')) {
@@ -416,7 +418,7 @@ export function roomHandlers(deps: RoomDeps) {
             if (!open) return new Response(JSON.stringify({ error: 'registration_closed', message: '本部署已关闭注册，请联系管理员邀请' }), { status: 403, headers: { 'content-type': 'application/json' } });
           }
         } catch {}
-        return getAuth(E).handler(req);
+        return getAuth(E, origin).handler(req);
       },
     },
   ];
