@@ -18,7 +18,8 @@
     "web:dev": "npm run dev --prefix apps/web",
     "web:build": "npm run build --prefix apps/web",
     "build": "npm run cf:build",
-    "deploy": "npm run cf:deploy"
+    "deploy": "npm run db:migrate && npm run cf:deploy",
+    "db:migrate": "wrangler d1 migrations apply DB --remote"
   },
   "dependencies": {
     "@ai-sdk/provider-v5": "npm:@ai-sdk/provider@2.0.3",
