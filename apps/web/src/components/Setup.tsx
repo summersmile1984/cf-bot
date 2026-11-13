@@ -74,6 +74,12 @@ export function Setup({ productName, onDone }: { productName: string; onDone: ()
                 </span>
               </li>
               <li className="flex items-center justify-between rounded-xl border border-[var(--color-line)] px-3 py-2">
+                <span>会话密钥（BETTER_AUTH_SECRET）</span>
+                <span className={checks?.authSecret ? 'text-green-600' : 'text-amber-600'}>
+                  {checks?.authSecret ? '已配置 ✓' : '未配置——登录会话需要它（openssl rand -hex 32 生成后设为 Secret）'}
+                </span>
+              </li>
+              <li className="flex items-center justify-between rounded-xl border border-[var(--color-line)] px-3 py-2">
                 <span>公开地址（L1_PUBLIC_URL）</span>
                 <span className="truncate pl-3 text-right text-xs text-[var(--color-mut)]">
                   {checks?.l1PublicUrl || `建议设为 ${checks?.detectedOrigin || '（你的站点 URL）'}`}

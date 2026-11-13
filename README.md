@@ -20,7 +20,7 @@ An open-source, self-hosted AI secretary with a two-layer architecture: a cloud 
 ## Quick start (≈5 minutes)
 
 1. Click **Deploy to Cloudflare** above (you need a free Cloudflare account). D1, Durable Objects, Queues, Vectorize and Workers AI are provisioned automatically.
-2. Add one secret when prompted: **`DEEPSEEK_API_KEY`** (get one at platform.deepseek.com).
+2. Add two secrets when prompted: **`DEEPSEEK_API_KEY`** (platform.deepseek.com) and **`BETTER_AUTH_SECRET`** (`openssl rand -hex 32`).
 3. Open your `*.workers.dev` URL — the **first-run setup wizard** greets you: create the admin account (first user = admin), then a config checklist (DeepSeek key / public URL / product name). Registration is closed by default after setup; re-open it anytime in Settings.
 4. *(Optional, for heavy tasks)* Install the desktop agent from [Releases](../../releases), point `L1_PULL_URL` at your deployment, and let it claim tasks.
 
@@ -48,6 +48,6 @@ Fair Source — [Functional Source License 1.1 (ALv2)](LICENSE): free for person
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/summersmile1984/cf-bot)
 
-**快速开始**：点上面的 Deploy 按钮（需免费 Cloudflare 账号，数据库等资源自动开通）→ 按提示填 `DEEPSEEK_API_KEY` → 打开你的 `*.workers.dev` 域名，**首跑向导**会带你建管理员账号并检查配置；完成后默认关闭注册（管理员可在设置里重开）。重任务装桌面端（Releases）后在本地电脑执行。
+**快速开始**：点上面的 Deploy 按钮（需免费 Cloudflare 账号，数据库等资源自动开通）→ 按提示填 `DEEPSEEK_API_KEY` 与 `BETTER_AUTH_SECRET`（openssl rand -hex 32）→ 打开你的 `*.workers.dev` 域名，**首跑向导**会带你建管理员账号并检查配置；完成后默认关闭注册（管理员可在设置里重开）。重任务装桌面端（Releases）后在本地电脑执行。
 
 **许可**：FSL-1.1-ALv2 公平源——个人/企业内部/教研免费，**禁止商业托管与竞品运营**，每版本两年后转 Apache-2.0。

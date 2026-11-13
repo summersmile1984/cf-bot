@@ -8,7 +8,7 @@ import { getAuth } from '../auth';
 export type OnboardingStatus = {
   needsSetup: boolean;
   signupsOpen: boolean;
-  checks: { deepseekKey: boolean; l1PublicUrl: string; detectedOrigin: string; productName: string };
+  checks: { deepseekKey: boolean; authSecret: boolean; l1PublicUrl: string; detectedOrigin: string; productName: string };
 };
 
 export async function ensureAppSettings(db: any): Promise<void> {
@@ -58,6 +58,7 @@ export async function getOnboardingStatus(db: any, E: any, requestUrl: string): 
     signupsOpen: await isSignUpOpen(db),
     checks: {
       deepseekKey: !!E.DEEPSEEK_API_KEY,
+      authSecret: !!E.BETTER_AUTH_SECRET,
       l1PublicUrl: String(E.L1_PUBLIC_URL ?? ''),
       detectedOrigin: origin,
       productName: 'cf-bot',

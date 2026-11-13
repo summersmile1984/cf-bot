@@ -368,7 +368,7 @@ export async function exportOmDownload(format: 'json' | 'md'): Promise<void> {
 export type OnboardingStatus = {
   needsSetup: boolean;
   signupsOpen: boolean;
-  checks: { deepseekKey: boolean; l1PublicUrl: string; detectedOrigin: string; productName: string };
+  checks: { deepseekKey: boolean; authSecret: boolean; l1PublicUrl: string; detectedOrigin: string; productName: string };
 };
 
 export async function getOnboardingStatus(): Promise<OnboardingStatus> {
