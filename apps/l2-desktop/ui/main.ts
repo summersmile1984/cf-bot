@@ -7,6 +7,7 @@ type DeviceSettings = {
   token: string;
   intervalMs: number;
   harness?: string | null;
+  deviceId?: string | null;
 };
 
 type HarnessStatus = {
@@ -65,8 +66,17 @@ app.innerHTML = `
           <label class="field">L1 URL
             <input id="inpL1" type="url" placeholder="${DEFAULT_L1}" />
           </label>
-          <label class="field">Device / PUSH token
-            <input id="inpToken" type="password" autocomplete="off" placeholder="device pairing token" />
+          <label class="field">配对码（在网页「管理 → 设备」生成）
+            <input id="inpCode" autocomplete="off" placeholder="8 位配对码" />
+          </label>
+          <label class="field">设备名（可空）
+            <input id="inpDevName" placeholder="如 公司电脑 / 家里电脑" />
+          </label>
+          <div class="actions">
+            <button id="btnPair" class="primary">配对这台电脑</button>
+          </div>
+          <label class="field">设备凭据（配对后自动填写）
+            <input id="inpToken" type="password" autocomplete="off" placeholder="device token" />
           </label>
           <label class="field">Poll interval (ms)
             <input id="inpInterval" type="number" min="1000" step="500" value="2000" />
@@ -76,7 +86,7 @@ app.innerHTML = `
             <button id="btnReloadChat">Reload chat</button>
           </div>
           <div class="hint">
-            Token is stored in <code>~/.config/mastra-l2/device.json</code> (never shown in docs/shots).
+            凭据存在 <code>~/.config/mastra-l2/device.json</code> (never shown in docs/shots).
             macOS CUA needs Screen Recording + Accessibility for <code>cua-spacesd</code>.
             <br />
             <a href="#" id="linkScreen">Screen Recording help</a> ·
@@ -146,6 +156,9 @@ const el = {
   btnReloadChat: document.querySelector('#btnReloadChat') as HTMLButtonElement,
   inpL1: document.querySelector('#inpL1') as HTMLInputElement,
   inpToken: document.querySelector('#inpToken') as HTMLInputElement,
+  inpCode: document.querySelector('#inpCode') as HTMLInputElement,
+  inpDevName: document.querySelector('#inpDevName') as HTMLInputElement,
+  btnPair: document.querySelector('#btnPair') as HTMLButtonElement,
   inpInterval: document.querySelector('#inpInterval') as HTMLInputElement,
   log: document.querySelector('#log') as HTMLElement,
   harnessList: document.querySelector('#harnessList') as HTMLElement,
@@ -179,6 +192,7 @@ function chatUrl(l1: string) {
 
 function applySettings(s: DeviceSettings) {
   currentHarness = s.harness ?? null;
+  currentDeviceId = s.deviceId ?? null;
   el.inpL1.value = s.l1Url || DEFAULT_L1;
   el.inpToken.value = s.token || '';
   el.inpInterval.value = String(s.intervalMs || 2000);
@@ -222,10 +236,35 @@ async function saveSettings() {
     token: el.inpToken.value.trim(),
     intervalMs: Math.max(1000, Number(el.inpInterval.value) || 2000),
     harness: currentHarness,
+    deviceId: currentDeviceId,
   };
   await invoke('save_settings', { settings: s });
   applySettings(s);
   log('settings saved');
+}
+
+/** 配对（multi-device S2.5）：一次性码换设备凭据，存 device.json */
+async function pairDevice() {
+  const code = el.inpCode.value.trim();
+  if (!code) { log('请先填入网页生成的配对码'); return; }
+  const l1 = (el.inpL1.value || DEFAULT_L1).replace(/\/$/, '');
+  try {
+    const r = await fetch(`${l1}/devices/pair`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code, name: el.inpDevName.value.trim() || undefined, capabilities: { platform: navigator.platform } }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const j = await r.json().catch(() => null);
+    if (!r.ok || !j?.token) { log(`配对失败：${j?.error ?? `HTTP ${r.status}`}`); return; }
+    el.inpToken.value = String(j.token);
+    currentDeviceId = String(j.deviceId ?? '');
+    await saveSettings();
+    el.inpCode.value = '';
+    log(`配对成功：${currentDeviceId}`);
+  } catch (e) {
+    log(`配对失败：${e}`);
+  }
 }
 
 async function refreshStatus() {
@@ -238,6 +277,7 @@ async function refreshStatus() {
 }
 
 let currentHarness: string | null = null;
+let currentDeviceId: string | null = null;
 
 async function refreshHarness() {
   try {
@@ -522,6 +562,9 @@ el.btnMcpRefresh.addEventListener('click', () => void refreshMcp());
 
 el.btnSave.addEventListener('click', () => {
   saveSettings().catch((e) => log(String(e)));
+});
+el.btnPair.addEventListener('click', () => {
+  void pairDevice();
 });
 el.btnReloadChat.addEventListener('click', () => {
   el.chatFrame.src = chatUrl(el.inpL1.value || DEFAULT_L1);

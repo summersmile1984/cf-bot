@@ -6,7 +6,7 @@
  *   返回 SSE 文本增量，流结束后把 assistant 消息写回 messages（房间内所有成员可见）
  * - 同步：GET /rooms/:id/messages?after= 轮询，返回 {messages, busy}
  */
-import { requireSession, AuthError, getAuth, type AuthEnv } from '../auth';
+import { requireSession, AuthError, getAuth, verifyTurnstile, type AuthEnv } from '../auth';
 import { getPersona } from '../mastra/persona';
 import { ensureTopicCols, getRoomRow, resourceFor, topicCatalogText, createTopicRoom, setSticky } from './topics';
 import { routeMessage } from './routing';
@@ -416,6 +416,19 @@ export function roomHandlers(deps: RoomDeps) {
           if (req.method === 'POST' && url.pathname.includes('/sign-up')) {
             const open = await isSignUpOpen(E.DB);
             if (!open) return new Response(JSON.stringify({ error: 'registration_closed', message: '本部署已关闭注册，请联系管理员邀请' }), { status: 403, headers: { 'content-type': 'application/json' } });
+            // 注册防刷（saas S2.7）：Workers Rate Limiting binding 按 IP 限频（未绑则退化到 better-auth 进程内限频）
+            const ip = req.headers.get('cf-connecting-ip') ?? '';
+            const limiter: any = (E as any).SIGNUP_RATE_LIMITER;
+            if (limiter?.limit) {
+              // Workers Rate Limiting 是近似限流（按机房、后台同步计数）——软闸挡洪水，硬闸靠 Turnstile
+              const r: any = await limiter.limit({ key: ip || 'unknown' }).catch(() => null);
+              if (r && !r.success) return new Response(JSON.stringify({ error: 'rate_limited', message: '注册太频繁，请稍后再试' }), { status: 429, headers: { 'content-type': 'application/json' } });
+            }
+            // 注册挑战（saas S2.6）：Turnstile（未配置密钥则跳过）；token 在 body 的 turnstileToken 字段
+            let tsToken = '';
+            try { tsToken = String((await req.clone().json())?.turnstileToken ?? ''); } catch {}
+            const ts = await verifyTurnstile(E, tsToken, ip);
+            if (!ts.ok) return new Response(JSON.stringify({ error: 'turnstile_failed', message: ts.reason }), { status: 403, headers: { 'content-type': 'application/json' } });
           }
         } catch {}
         return getAuth(E, origin).handler(req);

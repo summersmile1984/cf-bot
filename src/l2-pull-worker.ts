@@ -14,10 +14,10 @@ import { withProxy, resolveProxyUrl } from './l2/proxy-fetch.js';
 import { syncManagedConnections } from './l2/mcp-sync.js';
 
 const BASE = String(process.env.L1_PULL_URL || 'http://localhost:4120').replace(/\/$/, '');
-const TOKEN = process.env.PUSH_TOKEN || '';
+const TOKEN = process.env.L2_DEVICE_TOKEN || process.env.PUSH_TOKEN || '';
 const INTERVAL = Number(process.env.L2_PULL_INTERVAL_MS || 2000);
 let lastManagedSync = 0;
-if (!TOKEN) { console.error('[L2-pull] PUSH_TOKEN missing'); process.exit(1); }
+if (!TOKEN) { console.error('[L2-pull] L2_DEVICE_TOKEN / PUSH_TOKEN missing'); process.exit(1); }
 const headers = { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}` };
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 

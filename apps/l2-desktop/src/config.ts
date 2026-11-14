@@ -11,6 +11,7 @@ export type L2Config = {
   token: string;
   intervalMs: number;
   harness?: string;
+  deviceId?: string;
 };
 
 export function devicePath() {
@@ -27,6 +28,7 @@ function fromFile(): Partial<L2Config> {
       token: typeof j.token === 'string' ? j.token : undefined,
       intervalMs: typeof j.intervalMs === 'number' ? j.intervalMs : undefined,
       harness: typeof j.harness === 'string' ? j.harness : undefined,
+      deviceId: typeof j.deviceId === 'string' ? j.deviceId : undefined,
     };
   } catch {
     return {};
@@ -36,11 +38,13 @@ function fromFile(): Partial<L2Config> {
 export function loadConfig(): L2Config {
   const file = fromFile();
   const l1Url = String(process.env.L1_PULL_URL || file.l1Url || 'http://localhost:4120').replace(/\/$/, '');
-  const token = String(process.env.PUSH_TOKEN || process.env.L2_DEVICE_TOKEN || file.token || '');
+  // 设备身份优先（multi-device）：L2_DEVICE_TOKEN 是配对换来的设备凭据；PUSH_TOKEN 为共享老路径
+  const token = String(process.env.L2_DEVICE_TOKEN || process.env.PUSH_TOKEN || file.token || '');
   const intervalMs = Number(process.env.L2_PULL_INTERVAL_MS || file.intervalMs || 2000);
   const harness = String(process.env.L2_HARNESS || file.harness || '') || undefined;
-  if (!token) throw new Error('Missing PUSH_TOKEN / L2_DEVICE_TOKEN (or ~/.config/mastra-l2/device.json token)');
-  return { l1Url, token, intervalMs, harness };
+  const deviceId = String(process.env.L2_DEVICE_ID || file.deviceId || '') || undefined;
+  if (!token) throw new Error('Missing L2_DEVICE_TOKEN / PUSH_TOKEN (or ~/.config/mastra-l2/device.json token)');
+  return { l1Url, token, intervalMs, harness, deviceId };
 }
 
 /** 读设备默认 harness（UI 设为默认写入 device.json 后，claim loop 据此重报 L1）。 */
@@ -51,7 +55,7 @@ export function readDeviceHarness(): string | undefined {
 export function saveConfig(cfg: L2Config) {
   const dir = join(homedir(), '.config', 'mastra-l2');
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const merged = { ...fromFile(), l1Url: cfg.l1Url, token: cfg.token, intervalMs: cfg.intervalMs, ...(cfg.harness ? { harness: cfg.harness } : {}) };
+  const merged = { ...fromFile(), l1Url: cfg.l1Url, token: cfg.token, intervalMs: cfg.intervalMs, ...(cfg.harness ? { harness: cfg.harness } : {}), ...(cfg.deviceId ? { deviceId: cfg.deviceId } : {}) };
   writeFileSync(devicePath(), JSON.stringify(merged, null, 2), {
     mode: 0o600,
   });

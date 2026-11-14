@@ -86,8 +86,8 @@ export async function signIn(email: string, password: string): Promise<User> {
   return s.user;
 }
 
-export async function signUp(name: string, email: string, password: string): Promise<User> {
-  const r = await fetch('/auth/sign-up/email', jsonInit('POST', { name, email, password }));
+export async function signUp(name: string, email: string, password: string, turnstileToken?: string): Promise<User> {
+  const r = await fetch('/auth/sign-up/email', jsonInit('POST', { name, email, password, ...(turnstileToken ? { turnstileToken } : {}) }));
   const s = await j<{ user: User }>(r);
   return s.user;
 }
@@ -368,6 +368,7 @@ export async function exportOmDownload(format: 'json' | 'md'): Promise<void> {
 export type OnboardingStatus = {
   needsSetup: boolean;
   signupsOpen: boolean;
+  turnstileSitekey: string | null;
   checks: { deepseekKey: boolean; authSecret: boolean; l1PublicUrl: string; detectedOrigin: string; productName: string };
 };
 
@@ -383,5 +384,112 @@ export async function completeSetup(input: { name?: string; email: string; passw
 
 export async function setRegistration(open: boolean): Promise<{ ok: boolean; reason?: string }> {
   const r = await fetch('/settings/registration', { ...jsonInit('PUT', { open }), credentials: 'same-origin' });
+  return j(r);
+}
+
+// ---------- L2 控制台（l2-console） ----------
+export type AgentDef = {
+  id: string; name: string; description?: string | null; instructions: string; model?: string | null;
+  tools_json?: string | null; mcp_json?: string | null; skills_json?: string | null; memory_json?: string | null;
+  updated_at?: number;
+};
+export type PermRule = { category_or_tool: string; policy: string; updated_at?: number };
+export type Schedule = {
+  id: string; name: string; prompt: string; cron: string; timezone?: string | null;
+  target_type?: string; target_id?: string | null; enabled: boolean; next_run_at?: number | null; last_run_at?: number | null;
+};
+export type HarnessInfo = { id: string; name: string; description?: string; command?: string };
+
+export async function listAgentDefs(): Promise<AgentDef[]> {
+  const r = await fetch('/agent-defs', { credentials: 'same-origin' });
+  const j = await r.json();
+  return j.experts ?? j.defs ?? j.agentDefs ?? (Array.isArray(j) ? j : []);
+}
+export async function createAgentDef(body: Partial<AgentDef>): Promise<AgentDef> {
+  const r = await fetch('/agent-defs', { ...jsonInit('POST', body), credentials: 'same-origin' });
+  const j = await r.json();
+  return j.expert ?? j;
+}
+export async function updateAgentDef(id: string, body: Partial<AgentDef>): Promise<AgentDef> {
+  const r = await fetch(`/agent-defs/${id}`, { ...jsonInit('PUT', body), credentials: 'same-origin' });
+  const j = await r.json();
+  return j.expert ?? j;
+}
+export async function deleteAgentDef(id: string): Promise<void> {
+  await fetch(`/agent-defs/${id}`, { ...jsonInit('DELETE'), credentials: 'same-origin' });
+}
+
+export async function getPermissions(): Promise<{ rules: PermRule[]; settings: { auto_review: number } }> {
+  const r = await fetch('/permissions', { credentials: 'same-origin' });
+  return j(r);
+}
+export async function putPermissions(rules: PermRule[], autoReview: boolean): Promise<{ rules: PermRule[] }> {
+  const r = await fetch('/permissions', { ...jsonInit('PUT', { rules, auto_review: autoReview ? 1 : 0 }), credentials: 'same-origin' });
+  return j(r);
+}
+export async function deletePermission(tool: string): Promise<{ ok: boolean }> {
+  const r = await fetch(`/permissions/${encodeURIComponent(tool)}`, { ...jsonInit('DELETE'), credentials: 'same-origin' });
+  return j(r);
+}
+
+export async function listSchedules(): Promise<Schedule[]> {
+  const r = await fetch('/schedules', { credentials: 'same-origin' });
+  const jj = await r.json();
+  return jj.schedules ?? jj;
+}
+export async function createSchedule(body: Partial<Schedule>): Promise<Schedule> {
+  const r = await fetch('/schedules', { ...jsonInit('POST', body), credentials: 'same-origin' });
+  const jj = await r.json();
+  return jj.schedule ?? jj;
+}
+export async function updateSchedule(id: string, body: Partial<Schedule>): Promise<Schedule> {
+  const r = await fetch(`/schedules/${id}`, { ...jsonInit('PUT', body), credentials: 'same-origin' });
+  const jj = await r.json();
+  return jj.schedule ?? jj;
+}
+export async function deleteSchedule(id: string): Promise<void> {
+  await fetch(`/schedules/${id}`, { ...jsonInit('DELETE'), credentials: 'same-origin' });
+}
+export async function runScheduleNow(id: string): Promise<{ ok: boolean; note?: string; error?: string }> {
+  const r = await fetch(`/schedules/${id}/run`, { ...jsonInit('POST', {}), credentials: 'same-origin' });
+  return j(r);
+}
+export async function listScheduleRuns(id: string): Promise<{ runs: Array<{ id?: string; status: string; detail?: string; created_at?: number }> }> {
+  const r = await fetch(`/schedules/${id}/runs`, { credentials: 'same-origin' });
+  return j(r);
+}
+
+export async function getHarnessSettings(): Promise<{ harness: string | null; catalog: HarnessInfo[] }> {
+  const r = await fetch('/harness-settings', { credentials: 'same-origin' });
+  return j(r);
+}
+export async function setHarnessDefault(harness: string | null): Promise<{ ok?: boolean; harness?: string | null; error?: string }> {
+  const r = await fetch('/harness-settings', { ...jsonInit('PUT', { harness }), credentials: 'same-origin' });
+  return j(r);
+}
+
+export type DeviceInfo = {
+  id: string; name: string; capabilities: Record<string, unknown>;
+  lastSeenAt: number | null; status: string; isDefault: boolean; createdAt: number;
+};
+export async function listDevices(): Promise<DeviceInfo[]> {
+  const r = await fetch('/devices', { credentials: 'same-origin' });
+  const jj = await r.json();
+  return jj.devices ?? [];
+}
+export async function createPairingCode(): Promise<{ code: string; expiresAt: number }> {
+  const r = await fetch('/devices/pairing-code', { ...jsonInit('POST', {}), credentials: 'same-origin' });
+  return j(r);
+}
+export async function renameDevice(id: string, name: string): Promise<{ ok?: boolean; error?: string }> {
+  const r = await fetch(`/devices/${encodeURIComponent(id)}`, { ...jsonInit('PUT', { name }), credentials: 'same-origin' });
+  return j(r);
+}
+export async function revokeDevice(id: string): Promise<{ ok?: boolean; error?: string }> {
+  const r = await fetch(`/devices/${encodeURIComponent(id)}`, { ...jsonInit('DELETE'), credentials: 'same-origin' });
+  return j(r);
+}
+export async function setDefaultDevice(deviceId: string | null): Promise<{ ok?: boolean; error?: string }> {
+  const r = await fetch('/devices/default', { ...jsonInit('POST', { deviceId }), credentials: 'same-origin' });
   return j(r);
 }

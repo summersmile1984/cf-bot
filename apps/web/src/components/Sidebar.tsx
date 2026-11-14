@@ -71,6 +71,7 @@ export function Sidebar({
   onOpenSettings,
   onOpenMcp,
   onOpenMemory,
+  onOpenL2,
 }: {
   rooms: Room[];
   activeId: string | null;
@@ -81,6 +82,7 @@ export function Sidebar({
   onOpenSettings: () => void;
   onOpenMcp: () => void;
   onOpenMemory: () => void;
+  onOpenL2: () => void;
 }) {
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState('');
@@ -206,6 +208,12 @@ export function Sidebar({
           className="rounded-full border border-[var(--color-line)] px-2.5 py-1 text-xs text-[var(--color-mut)] hover:text-[var(--color-fg)]"
         >
           记忆
+        </button>
+        <button
+          onClick={onOpenL2}
+          className="rounded-full border border-[var(--color-line)] px-2.5 py-1 text-xs text-[var(--color-mut)] hover:text-[var(--color-fg)]"
+        >
+          管理
         </button>
         <button
           onClick={onOpenSettings}

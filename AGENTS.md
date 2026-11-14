@@ -38,6 +38,7 @@
 - 密码/令牌：`request_secret` HITL → 服务端 vault（10min TTL）→ 模型只见 `secretRef` 句柄；派发时绑定为 L2 子进程 env + 一次性 0600 文件，任务结束销毁。明文永不进模型上下文/日志/SSE。
 - Push 回调：精确 URL 白名单（`AllowlistedPushSender`）或公网时官方 sender（SSRF 防护）；token 用 `timingSafeEqual`。
 - 出口脱敏：`sanitizeUserFacing`（路径/UUID/`sk-` 密钥/L2 术语）+ `redactKnownSecrets`。
+- 任务链归属（多租户硬约束）：`l2_tasks.owner_id` 为准——设备 token 只能认领/回调/上报**本人**任务（claim/callback/progress/ask/artifact/secret 同界）；凭证条目按 `vault_meta.user_id` 归属过滤。共享 `PUSH_TOKEN` 是无身份 legacy 通道，只能碰无主任务，SaaS 公网部署前停用。
 
 ## 6. 非目标（不要做）
 

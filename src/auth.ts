@@ -16,7 +16,31 @@ export type AuthEnv = {
   L1_PUBLIC_URL?: string;
   PUSH_TOKEN?: string;
   AUTH_DEV_MODE?: string;
+  TURNSTILE_SECRET_KEY?: string; // 注册挑战（saas S2.6）：未配置则跳过挑战
+  TURNSTILE_SITEKEY?: string; // 公开值，经 /onboarding/status 下发给注册表单
 };
+
+/**
+ * Turnstile 注册挑战校验（saas S2.6）：未配置密钥 = 不挑战（自部署可关）；
+ * 站点密钥/私钥在 Cloudflare 控制台 Turnstile 里建，hostname 填部署域名。
+ */
+export async function verifyTurnstile(E: AuthEnv, token: string | undefined, ip: string): Promise<{ ok: boolean; reason?: string }> {
+  const secret = String(E.TURNSTILE_SECRET_KEY ?? '');
+  if (!secret) return { ok: true }; // 未配置：跳过
+  if (!token) return { ok: false, reason: '请完成人机验证' };
+  try {
+    const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ secret, response: token, remoteip: ip || undefined }),
+      signal: AbortSignal.timeout(8000),
+    });
+    const data: any = await res.json().catch(() => null);
+    return data?.success ? { ok: true } : { ok: false, reason: '人机验证未通过，请重试' };
+  } catch {
+    return { ok: false, reason: '人机验证服务暂不可用，请稍后再试' };
+  }
+}
 
 let cached: { key: string; auth: ReturnType<typeof betterAuth> } | null = null;
 

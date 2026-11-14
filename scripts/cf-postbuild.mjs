@@ -12,7 +12,11 @@ rmSync(`${out}/static`, { recursive: true, force: true });
 const webDist = 'apps/web/dist';
 if (existsSync(`${webDist}/index.html`)) {
   cpSync(webDist, `${out}/static`, { recursive: true });
-  console.log('[cf-postbuild] SPA apps/web/dist -> ./static (root)');
+  // /app 双挂（multi-device 回归修复）：桌面内嵌聊天固定指向 {L1}/app，重构把 SPA 挪到根路径后
+  // /app 掉进 Worker playground；assets 是绝对路径 /assets/*，同壳挂到 app/ 不用改 base。
+  mkdirSync(`${out}/static/app`, { recursive: true });
+  copyFileSync(`${webDist}/index.html`, `${out}/static/app/index.html`);
+  console.log('[cf-postbuild] SPA apps/web/dist -> ./static (root) + ./static/app (/app 兼容)');
 } else {
   console.log('[cf-postbuild] WARN: apps/web/dist 未找到，跳过 SPA（先跑 npm run web:build）');
 }
@@ -55,6 +59,7 @@ w.ai = { binding: 'AI' };
 // Paid 套餐显式锁 30s CPU（免费版曾拒绝此配置，API 100328）
 w.limits = { cpu_ms: 30000 };
 // Workers AI provider（Mastra provider-registry）鉴权：CLOUDFLARE_API_KEY secret + 账号 ID
+// 注意：以下为私有部署值，开源导出（export-open-source.mjs）会抹空——勿从导出目录回拷本文件
 w.vars = { ...(w.vars ?? {}), CLOUDFLARE_ACCOUNT_ID: '' };
 // 密钥托管（secret-pipeline）：值存 Workers Secrets（动态 env 键，vault.ts 运行时 env[name] 读回）。
 // 旧 Secrets Store 店级绑定 wrangler 不支持（secrets_store 字段被丢弃），已移除；VAULT_STORE_ID 仅留作旧 store 标识。
@@ -101,9 +106,11 @@ try {
     const vb = Object.fromEntries((root.vectorize ?? []).map((v) => [v.binding, v.index_name]));
     w.vectorize = w.vectorize.map((v) => ({ ...v, index_name: vb[v.binding] ?? v.index_name }));
   }
-  for (const k of ['L1_PUBLIC_URL', 'CLOUDFLARE_ACCOUNT_ID', 'VAULT_STORE_ID']) {
+  for (const k of ['L1_PUBLIC_URL', 'CLOUDFLARE_ACCOUNT_ID', 'VAULT_STORE_ID', 'TURNSTILE_SITEKEY']) {
     if (root?.vars?.[k]) w.vars[k] = root.vars[k];
   }
+  // 注册限流 binding（saas S2.7）：根配置声明，产物原样带上（wrangler 字段名是 ratelimits）
+  if (Array.isArray(root?.ratelimits) && root.ratelimits.length) w.ratelimits = root.ratelimits;
 } catch { /* 无根配置或解析失败：用兜底值 */ }
 writeFileSync(f, JSON.stringify(w, null, 2));
 console.log('[cf-postbuild] assets -> ./static, main -> ./worker-entry.mjs, DO ROOM_DO, AI + VECTORIZE + queues(om-cycles)');

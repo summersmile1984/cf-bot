@@ -8,6 +8,7 @@ import { getAuth } from '../auth';
 export type OnboardingStatus = {
   needsSetup: boolean;
   signupsOpen: boolean;
+  turnstileSitekey: string | null;
   checks: { deepseekKey: boolean; authSecret: boolean; l1PublicUrl: string; detectedOrigin: string; productName: string };
 };
 
@@ -36,17 +37,24 @@ export async function userCount(db: any): Promise<number> {
   return Number(row?.n ?? 0);
 }
 
-/** 注册闸门：无用户（首跑中）或显式开放时允许 sign-up */
+/** 注册闸门：显式 '1' 开 / '0' 关；**未配置默认开放**（SaaS 获客需要——自部署由 completeSetup 显式关闭） */
 export async function isSignUpOpen(db: any): Promise<boolean> {
   try {
     await ensureAppSettings(db);
     const flag = await getSetting(db, 'signups_open');
-    if (flag === '1') return true;
     if (flag === '0') return false;
-    return (await userCount(db)) === 0; // 未配置：首跑开放，有用户后视作关闭
+    return true; // '1' 或未配置：开放（SaaS 默认；自部署 setup 完成时会显式置 '0'）
   } catch {
     return true;
   }
+}
+
+/** 管理员：显式设置优先；未设置时回退「最早注册用户」（SaaS 历史账号即管理员） */
+async function adminUserId(db: any): Promise<string | null> {
+  const explicit = await getSetting(db, 'admin_user_id');
+  if (explicit) return explicit;
+  const row: any = await db.prepare('SELECT id FROM user ORDER BY createdAt ASC LIMIT 1').first().catch(() => null);
+  return row?.id ?? null;
 }
 
 export async function getOnboardingStatus(db: any, E: any, requestUrl: string): Promise<OnboardingStatus> {
@@ -56,6 +64,7 @@ export async function getOnboardingStatus(db: any, E: any, requestUrl: string): 
   return {
     needsSetup: (await userCount(db)) === 0,
     signupsOpen: await isSignUpOpen(db),
+    turnstileSitekey: E.TURNSTILE_SITEKEY ? String(E.TURNSTILE_SITEKEY) : null,
     checks: {
       deepseekKey: !!E.DEEPSEEK_API_KEY,
       authSecret: !!E.BETTER_AUTH_SECRET,
@@ -92,7 +101,7 @@ export async function completeSetup(
 
 export async function setSignupsOpen(db: any, userId: string, open: boolean): Promise<{ ok: boolean; reason?: string }> {
   await ensureAppSettings(db);
-  const admin = await getSetting(db, 'admin_user_id');
+  const admin = await adminUserId(db);
   if (!admin || admin !== userId) return { ok: false, reason: '仅管理员可改' };
   await setSetting(db, 'signups_open', open ? '1' : '0');
   return { ok: true };

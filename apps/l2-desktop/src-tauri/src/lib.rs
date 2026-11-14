@@ -15,6 +15,8 @@ pub struct DeviceSettings {
     pub interval_ms: u64,
     #[serde(default)]
     pub harness: Option<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
 }
 
 impl Default for DeviceSettings {
@@ -24,6 +26,7 @@ impl Default for DeviceSettings {
             token: String::new(),
             interval_ms: 2000,
             harness: None,
+            device_id: None,
         }
     }
 }
@@ -323,6 +326,7 @@ fn start_claim_loop(app: tauri::AppHandle, state: tauri::State<'_, AppState>) ->
         .env("L1_PULL_URL", &settings.l1_url)
         .env("PUSH_TOKEN", &settings.token)
         .env("L2_DEVICE_TOKEN", &settings.token)
+        .env("L2_DEVICE_ID", settings.device_id.clone().unwrap_or_default())
         .env("L2_PULL_INTERVAL_MS", settings.interval_ms.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

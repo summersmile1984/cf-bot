@@ -38,6 +38,7 @@ import { roomHandlers } from '../l1/rooms';
 import { createTopicRoom, archiveTopic, getRoomRow, resourceFor } from '../l1/topics';
 import { publishPage, getPage, unpublishPage } from '../l1/pages';
 import { getOnboardingStatus, completeSetup, setSignupsOpen } from './onboarding';
+import { createPairingCode, registerDevice, listDevices, revokeDevice, renameDevice, setDefaultDevice, authDevice, resolveDeviceForTask, ensureDeviceTables } from './devices';
 import { chargeQuota, refundQuota, getQuota, applySubscription, addCredit, addCloudMinutes, TASK_POINTS, PUBLISH_POINTS, CLOUD_TASK_MINUTES } from './quota';
 import { ensureBillingTables, verifyPaddleSignature, handlePaddleEvent, createCheckout, getSubscription } from './billing';
 import { probeRoutes } from './probe-routes';
@@ -127,6 +128,7 @@ function db() {
     .then(() => d.prepare('ALTER TABLE l2_tasks ADD COLUMN ask_question TEXT').run().catch(() => null))
     .then(() => d.prepare('ALTER TABLE l2_tasks ADD COLUMN ask_answer TEXT').run().catch(() => null))
     .then(() => d.prepare('ALTER TABLE l2_tasks ADD COLUMN ask_count INTEGER NOT NULL DEFAULT 0').run().catch(() => null))
+    .then(() => d.prepare('ALTER TABLE l2_tasks ADD COLUMN owner_id TEXT').run().catch(() => null))
     .then(() => d.prepare(`CREATE TABLE IF NOT EXISTS task_artifacts (
       id TEXT PRIMARY KEY, task_id TEXT NOT NULL, kind TEXT NOT NULL, caption TEXT, data TEXT NOT NULL,
       created_at INTEGER NOT NULL)`).run())
@@ -142,11 +144,12 @@ function db() {
 const dispatch_to_sandbox = createTool({
   id: 'dispatch_to_sandbox',
   description: '',
-  inputSchema: z.object({ prompt: z.string(), runtime: z.enum(['cloud', 'local']).default('cloud'), harness: z.string().optional().describe('指定 ACP harness（如 dsh/codebuddy/claude-code）；缺省按 账号默认 → 设备默认 兜底') }),
-  execute: async ({ prompt, runtime, harness }: any, ctx: any) => {
+  inputSchema: z.object({ prompt: z.string(), runtime: z.enum(['cloud', 'local']).default('cloud'), harness: z.string().optional().describe('指定 ACP harness（如 dsh/codebuddy/claude-code）；缺省按 账号默认 → 设备默认 兜底'), device: z.string().optional().describe('目标设备名或 id（仅 local 任务）；缺省用默认设备，无默认则在线设备抢单') }),
+  execute: async ({ prompt, runtime, harness, device }: any, ctx: any) => {
     const hv = checkHarness(harness);
     if (typeof hv === 'object') return { ok: false, reason: hv.error };
     harness = hv || undefined;
+    if (device && runtime !== 'local') return { ok: false, reason: 'device 只用于 local 任务（云端执行不绑定设备）' };
     const threadId: string | undefined = ctx?.agent?.threadId ?? ctx?.threadId;
     const resourceId: string | undefined = ctx?.agent?.resourceId ?? ctx?.resourceId;
     if (!E.PUSH_TOKEN) return { ok: false, reason: '后台回调未配置（PUSH_TOKEN 未设置）' };
@@ -164,10 +167,21 @@ const dispatch_to_sandbox = createTool({
         const rows: any = await d.prepare("SELECT category_or_tool, policy FROM user_permission_rules WHERE user_id=?").bind(ownerId).all();
         for (const r of rows?.results ?? []) policies[String(r.category_or_tool)] = String(r.policy);
       } catch {}
+      // 多租户归属：owner 不明的任务不可派发（既无法路由设备，也无法计量/归属）
+      if (!ownerId) return { ok: false, reason: '缺少归属用户，无法派发' };
       // harness 默认链（S2.2）：显式 > 账号默认（设备默认由 L2 resolveHarness 兜底）
       const hResolved = harness || (ownerId ? await defaultHarness(d, ownerId) : null) || null;
+      // 任务设备路由（multi-device S2.1）：显式 > 默认设备 > NULL（抢单）；派发时解析落库
+      let deviceId: string | null = null;
+      if (runtime === 'local') {
+        const dr = await resolveDeviceForTask(d, ownerId, device ?? null);
+        if (!dr.ok) return { ok: false, reason: dr.reason };
+        deviceId = dr.deviceId;
+      } else {
+        await ensureDeviceTables(d);
+      }
       // 额度硬门（saas S2.4 计量点②）：长任务派发前扣减，不足即拒（三岔路提示）
-      if (ownerId) {
+      {
         const ch = await chargeQuota(d, ownerId, { kind: 'pool', units: TASK_POINTS, idempotencyKey: `task:${taskId}`, detail: '长任务派发' });
         if (!ch.ok) return { ok: false, reason: ch.reason };
         if (runtime === 'cloud') {
@@ -175,9 +189,9 @@ const dispatch_to_sandbox = createTool({
           if (!cc.ok) return { ok: false, reason: cc.reason };
         }
       }
-      await d.prepare('INSERT INTO l2_tasks (task_id,thread_id,resource_id,runtime,state,prompt,created_at,updated_at,harness,def_json) VALUES (?,?,?,?,?,?,?,?,?,?)')
-        .bind(taskId, threadId, resourceId ?? null, runtime, 'queued', text, now, now, hResolved, JSON.stringify({ policies })).run();
-      console.log('[L1] queued', JSON.stringify({ taskId, threadId, runtime }));
+      await d.prepare('INSERT INTO l2_tasks (task_id,thread_id,resource_id,runtime,state,prompt,created_at,updated_at,harness,def_json,device_id,owner_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+        .bind(taskId, threadId, resourceId ?? null, runtime, 'queued', text, now, now, hResolved, JSON.stringify({ policies }), deviceId, ownerId).run();
+      console.log('[L1] queued', JSON.stringify({ taskId, threadId, runtime, device: deviceId }));
       try { await notifyRoom(threadId, { kind: 'busy' }); } catch {}
       if (E.L2_A2A_URL) {
         try {
@@ -297,7 +311,7 @@ const job_status_tool = createTool({
       await ready;
       const threadId = String(ctx?.agent?.threadId || '');
       const { results } = await d
-        .prepare(`SELECT task_id, kind, state, progress FROM l2_tasks WHERE thread_id=? AND state IN ('queued','working') ORDER BY created_at DESC LIMIT 5`)
+        .prepare(`SELECT task_id, kind, state, progress, device_id FROM l2_tasks WHERE thread_id=? AND state IN ('queued','working') ORDER BY created_at DESC LIMIT 5`)
         .bind(threadId)
         .all();
       const jobs = (results ?? []).map((r: any) => {
@@ -306,7 +320,7 @@ const job_status_tool = createTool({
           const arr = JSON.parse(r.progress ?? '[]');
           last = String(arr?.at(-1)?.msg ?? '');
         } catch {}
-        return { id: String(r.task_id).slice(0, 8), kind: r.kind ?? 'sandbox', status: r.state, last: last.slice(0, 120) };
+        return { id: String(r.task_id).slice(0, 8), kind: r.kind ?? 'sandbox', status: r.state, last: last.slice(0, 120), device: r.device_id ?? null };
       });
       return { jobs };
     } catch (e: any) {
@@ -379,12 +393,15 @@ const publish_page_tool = createTool({
       await ready;
       const threadId = String(ctx?.agent?.threadId || '');
       const owner: any = threadId ? await d.prepare('SELECT created_by FROM rooms WHERE id=?').bind(threadId).first() : null;
+      const ownerId = String(owner?.created_by ?? '');
+      // 多租户归属：owner 不明不发布（既无法归属页面，也绕过 PUBLISH_POINTS 计量）
+      if (!ownerId) return { ok: false, reason: '缺少归属用户，无法发布' };
       const pub = await publishPage(E as any, {
         html: String(html).slice(0, 2_000_000),
         title: String(title || '页面'),
         taskId: null,
         roomId: threadId || null,
-        userId: String(owner?.created_by ?? '') || null,
+        userId: ownerId,
       });
       if (!pub) return { ok: false, reason: '页面发布失败（Pages 上传出错）' };
       // 房间卡片消息（与 [artifact:id] 同构）
@@ -411,12 +428,14 @@ const dispatch_expert_tool = createTool({
     task: z.string().describe('交给专家的任务内容'),
     runtime: z.enum(['cloud', 'local']).default('local').describe('执行位：local=用户电脑，cloud=云电脑'),
     harness: z.string().optional().describe('指定 ACP harness（如 dsh/codebuddy/claude-code），覆盖专家默认'),
+    device: z.string().optional().describe('目标设备名或 id（仅 local 任务）；缺省用默认设备，无默认则在线设备抢单'),
   }),
-  execute: async ({ expert, task, runtime, harness }: any, ctx: any) => {
+  execute: async ({ expert, task, runtime, harness, device }: any, ctx: any) => {
     try {
       const hv = checkHarness(harness);
       if (typeof hv === 'object') return { ok: false, reason: hv.error };
       harness = hv || undefined;
+      if (device && runtime !== 'local') return { ok: false, reason: 'device 只用于 local 任务（云端执行不绑定设备）' };
       const { d, ready } = db();
       await ready;
       const def = await resolveExpert(d, String(expert ?? ''));
@@ -441,6 +460,8 @@ const dispatch_expert_tool = createTool({
         askDesc = String(personaCfg.tool_ask ?? '');
         artifactDesc = String(personaCfg.tool_artifact ?? '');
       } catch {}
+      // 多租户归属：owner 不明的任务不可派发（既无法路由设备，也无法计量/归属）
+      if (!ownerId) return { ok: false, reason: '缺少归属用户，无法派发' };
       // 定义快照（expert-forge S2.1）：完整 agent_defs 行随任务下发，L2 侧 JIT 构建；secretRef 不含明文
       const defJson = JSON.stringify({
         id: def.id, name: def.name, description: def.description, instructions: def.instructions,
@@ -450,8 +471,17 @@ const dispatch_expert_tool = createTool({
         progress_desc: progressDesc || null, ask_desc: askDesc || null, artifact_desc: artifactDesc || null,
       });
       const hResolved = harness || (ownerId ? await defaultHarness(d, ownerId) : null) || null;
+      // 任务设备路由（multi-device S2.1）：显式 > 默认设备 > NULL（抢单）；派发时解析落库
+      let deviceId: string | null = null;
+      if (runtime === 'local') {
+        const dr = await resolveDeviceForTask(d, ownerId, device ?? null);
+        if (!dr.ok) return { ok: false, reason: dr.reason };
+        deviceId = dr.deviceId;
+      } else {
+        await ensureDeviceTables(d);
+      }
       // 额度硬门（saas S2.4 计量点②）：专家任务同价扣减
-      if (ownerId) {
+      {
         const ch = await chargeQuota(d, ownerId, { kind: 'pool', units: TASK_POINTS, idempotencyKey: `task:${taskId}`, detail: '专家任务派发' });
         if (!ch.ok) return { ok: false, reason: ch.reason };
         if (runtime === 'cloud') {
@@ -459,8 +489,8 @@ const dispatch_expert_tool = createTool({
           if (!cc.ok) return { ok: false, reason: cc.reason };
         }
       }
-      await d.prepare('INSERT INTO l2_tasks (task_id,thread_id,resource_id,runtime,state,prompt,created_at,updated_at,kind,expert_id,instructions,def_json,harness) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
-        .bind(taskId, threadId, resourceId || null, runtime, 'queued', String(task).slice(0, 20000), now, now, 'expert', def.id, def.instructions, defJson, hResolved)
+      await d.prepare('INSERT INTO l2_tasks (task_id,thread_id,resource_id,runtime,state,prompt,created_at,updated_at,kind,expert_id,instructions,def_json,harness,device_id,owner_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+        .bind(taskId, threadId, resourceId || null, runtime, 'queued', String(task).slice(0, 20000), now, now, 'expert', def.id, def.instructions, defJson, hResolved, deviceId, ownerId)
         .run();
       try { await notifyRoom(threadId, { kind: 'busy' }); } catch {}
       return { ok: true, status: 'queued', expert: def.name, expertId: def.id, taskId };
@@ -764,6 +794,18 @@ const reqToken = (c: any) => {
   const auth = c.req.header('Authorization') ?? '';
   return auth.startsWith('Bearer ') ? auth.slice(7) : c.req.header('X-A2A-Notification-Token');
 };
+/** L2 设备面认证（multi-device S2.2）：device token（身份）优先，共享 PUSH_TOKEN 兼容（匿名，无身份）。 */
+const l2Auth = async (c: any): Promise<{ ok: boolean; deviceId: string | null; userId: string | null }> => {
+  const tok = reqToken(c) ?? '';
+  if (!tok) return { ok: false, deviceId: null, userId: null };
+  const { d, ready } = db(); await ready;
+  const dev = await authDevice(d, tok).catch(() => null);
+  if (dev) return { ok: true, deviceId: dev.id, userId: dev.user_id };
+  return { ok: tokenOk(tok), deviceId: null, userId: null };
+};
+/** 任务归属校验（多租户隔离）：请求身份必须是任务 owner；匿名（共享 token）只认无主 legacy 任务。 */
+const taskOwned = (task: any, ident: { userId: string | null }): boolean =>
+  String(task?.owner_id ?? '') === String(ident.userId ?? '');
 
 const TERMINAL = ['completed', 'failed', 'canceled', 'rejected'];
 const extractTask = (task: any) => {
@@ -774,11 +816,12 @@ const extractTask = (task: any) => {
   return { state, text };
 };
 /** 写入终态并 compose 回复；幂等（已终态则忽略）。返回 compose promise（若有） */
-const finalizeTask = async (taskId: string, state: string, text: string, src: string): Promise<{ ignored?: string; compose?: Promise<void> }> => {
+const finalizeTask = async (taskId: string, state: string, text: string, src: string, ident?: { userId: string | null }): Promise<{ ignored?: string; compose?: Promise<void> }> => {
   const { d, ready } = db(); await ready;
   const rec: any = await d.prepare('SELECT * FROM l2_tasks WHERE task_id=?').bind(taskId).first();
   console.log('[L1] finalize', JSON.stringify({ src, taskId, state, known: !!rec, chars: text.length }));
   if (!rec) return { ignored: 'unknown task' };
+  if (ident && !taskOwned(rec, ident)) return { ignored: 'foreign task' };
   if (TERMINAL.includes(rec.state)) return { ignored: 'duplicate' };
   const u = await d.prepare(`UPDATE l2_tasks SET state=?, result=?, updated_at=? WHERE task_id=? AND state NOT IN ('completed','failed','canceled','rejected')`)
     .bind(state, text.slice(0, 20000), Date.now(), taskId).run();
@@ -787,7 +830,7 @@ const finalizeTask = async (taskId: string, state: string, text: string, src: st
   if (state !== 'completed') {
     try {
       const own: any = await d.prepare('SELECT created_by FROM rooms WHERE id=?').bind(rec.thread_id).first();
-      const ownId = String(own?.created_by ?? '');
+      const ownId = String(rec.owner_id ?? own?.created_by ?? '');
       if (ownId) {
         await refundQuota(d, ownId, `task:${taskId}`, TASK_POINTS);
         if (String(rec.runtime) === 'cloud') await refundQuota(d, ownId, `cloud:${taskId}`, CLOUD_TASK_MINUTES);
@@ -1274,6 +1317,22 @@ export const mastra = new Mastra({
           return c.json(okDel ? { ok: true } : { error: 'not found' }, okDel ? 200 : 404);
         },
       } as any),
+      // L2 控制台（l2-console S2.5）：立即运行——置 next_run_at=0，下个 cron tick（≤1 分钟）执行
+      registerApiRoute('/schedules/:id/run', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const id = String(c.req.param('id') ?? '');
+          const { d, ready } = db(); await ready;
+          const rec: any = await d.prepare('SELECT id, enabled FROM schedules WHERE id=? AND user_id=?').bind(id, u.id).first();
+          if (!rec) return c.json({ error: 'not found' }, 404);
+          if (!Number(rec.enabled)) return c.json({ error: '例程未启用，启用后可立即运行' }, 400);
+          await d.prepare('UPDATE schedules SET next_run_at=? WHERE id=?').bind(0, id).run();
+          return c.json({ ok: true, note: '已触发，≤1 分钟内执行' });
+        },
+      } as any),
       registerApiRoute('/schedules/:id/runs', {
         method: 'GET',
         requiresAuth: false,
@@ -1327,6 +1386,20 @@ export const mastra = new Mastra({
           return c.json({ rules });
         },
       } as any),
+      // L2 控制台（l2-console S2.5）：删除单条权限规则
+      registerApiRoute('/permissions/:tool', {
+        method: 'DELETE',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const tool = String(c.req.param('tool') ?? '');
+          if (!tool) return c.json({ error: 'bad tool' }, 400);
+          const { d, ready } = db(); await ready;
+          const r = await d.prepare('DELETE FROM user_permission_rules WHERE user_id=? AND category_or_tool=?').bind(u.id, tool).run();
+          return c.json({ ok: !!r?.meta?.changes });
+        },
+      } as any),
       // 密钥保管（schedules-secrets S2.3）：Secrets Store 托管，D1 只存元数据，不回密文
       registerApiRoute('/vault', {
         method: 'GET',
@@ -1345,7 +1418,7 @@ export const mastra = new Mastra({
         handler: async (c: any) => {
           const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
           // 设备令牌路径（mcp-library S2.3）：桌面 oauth-connect 存凭证用
-          const device = !u && tokenOk(reqToken(c));
+          const device = !u && (await l2Auth(c)).ok;
           if (!u && !device) return c.json({ error: 'unauthorized' }, 401);
           const body: any = await c.req.json().catch(() => ({}));
           const { d, ready } = db();
@@ -1377,7 +1450,7 @@ export const mastra = new Mastra({
         handler: async (c: any) => {
           const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
           // 设备令牌路径（mcp-library S2.3）：桌面断开集成删凭证用（user_id='device'）
-          const device = !u && tokenOk(reqToken(c));
+          const device = !u && (await l2Auth(c)).ok;
           if (!u && !device) return c.json({ error: 'unauthorized' }, 401);
           const { d, ready } = db();
           await ready;
@@ -1411,16 +1484,96 @@ export const mastra = new Mastra({
           return c.json({ persona });
         },
       } as any),
+      // 多设备（multi-device S2.2/S2.4）：配对码换设备凭据 + 设备管理面
+      registerApiRoute('/devices', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db(); await ready;
+          const rows = await listDevices(d, String(u.id));
+          return c.json({ devices: rows.map((r) => ({
+            id: r.id, name: r.name, capabilities: (() => { try { return r.capabilities ? JSON.parse(r.capabilities) : {}; } catch { return {}; } })(),
+            lastSeenAt: r.last_seen_at, status: r.status, isDefault: !!r.is_default, createdAt: r.created_at,
+          })) });
+        },
+      } as any),
+      registerApiRoute('/devices/pairing-code', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db(); await ready;
+          return c.json(await createPairingCode(d, String(u.id)));
+        },
+      } as any),
+      // 桌面配对：一次性码换设备凭据（码即凭证，无会话）
+      registerApiRoute('/devices/pair', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const body: any = await c.req.json().catch(() => ({}));
+          const { d, ready } = db(); await ready;
+          const r = await registerDevice(d, String(body?.code ?? ''), { name: body?.name, capabilities: body?.capabilities });
+          if (!r.ok) return c.json({ error: r.reason }, 400);
+          return c.json({ deviceId: r.deviceId, token: r.token, userId: r.userId }, 201);
+        },
+      } as any),
+      registerApiRoute('/devices/default', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const deviceId = body?.deviceId == null ? null : String(body.deviceId);
+          const { d, ready } = db(); await ready;
+          const r = await setDefaultDevice(d, String(u.id), deviceId);
+          return r.ok ? c.json({ ok: true }) : c.json({ error: r.reason }, 400);
+        },
+      } as any),
+      registerApiRoute('/devices/:id', {
+        method: 'PUT',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const { d, ready } = db(); await ready;
+          const ok = await renameDevice(d, String(u.id), String(c.req.param('id') ?? ''), String(body?.name ?? ''));
+          return ok ? c.json({ ok: true }) : c.json({ error: 'not found' }, 404);
+        },
+      } as any),
+      registerApiRoute('/devices/:id', {
+        method: 'DELETE',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db(); await ready;
+          const ok = await revokeDevice(d, String(u.id), String(c.req.param('id') ?? ''));
+          return ok ? c.json({ ok: true }) : c.json({ error: 'not found' }, 404);
+        },
+      } as any),
       // L2 出站 PULL：原子领取一个 queued 任务 → working
       registerApiRoute('/l2-claim', {
         method: 'POST',
         requiresAuth: false,
         handler: async (c: any) => {
-          if (!tokenOk(reqToken(c))) return c.json({ error: 'bad token' }, 401);
+          // 设备认证（multi-device S2.2）：device token 优先；共享 PUSH_TOKEN 兼容（匿名，只领无定向任务）
+          // 多租户归属：设备只领本用户的任务（含无定向单）；共享 token 无身份，只领无主 legacy 单
           const { d, ready } = db(); await ready;
+          let meId: string | null = null;
+          let meUser: string | null = null;
+          const dev = await authDevice(d, reqToken(c) ?? '').catch(() => null);
+          if (dev) { meId = dev.id; meUser = dev.user_id; }
+          else if (!tokenOk(reqToken(c))) return c.json({ error: 'bad token' }, 401);
           const row: any = await d.prepare(`UPDATE l2_tasks SET state='working', updated_at=?
-            WHERE task_id=(SELECT task_id FROM l2_tasks WHERE state='queued' ORDER BY created_at LIMIT 1) AND state='queued'
-            RETURNING task_id, prompt, runtime, thread_id, kind, expert_id, instructions, resource_id, def_json, harness`).bind(Date.now()).first();
+            WHERE task_id=(SELECT task_id FROM l2_tasks WHERE state='queued' AND owner_id IS ? AND (device_id IS NULL OR device_id IS ?) ORDER BY created_at LIMIT 1) AND state='queued'
+            RETURNING task_id, prompt, runtime, thread_id, kind, expert_id, instructions, resource_id, def_json, harness, device_id`)
+            .bind(Date.now(), meUser, meId).first();
           if (!row) return c.json({ task: null });
           // 专家模型在 claim 时从 agent_defs 取（指令已随任务快照；模型改动对未领取任务即时生效）
           let model: string | null = null;
@@ -1429,11 +1582,11 @@ export const mastra = new Mastra({
           }
           let def: any = null;
           try { def = row.def_json ? JSON.parse(row.def_json) : null; } catch {}
-          console.log('[L1] claimed', JSON.stringify({ taskId: row.task_id, kind: row.kind ?? 'sandbox' }));
+          console.log('[L1] claimed', JSON.stringify({ taskId: row.task_id, kind: row.kind ?? 'sandbox', device: meId }));
           return c.json({ task: {
             taskId: row.task_id, prompt: row.prompt ?? '', runtime: row.runtime ?? 'cloud', threadId: row.thread_id,
             kind: row.kind ?? 'sandbox', expertId: row.expert_id ?? null, instructions: row.instructions ?? null,
-            resourceId: row.resource_id ?? null, model, def, harness: row.harness ?? null,
+            resourceId: row.resource_id ?? null, model, def, harness: row.harness ?? null, deviceId: row.device_id ?? null,
           } });
         },
       } as any),
@@ -1443,13 +1596,18 @@ export const mastra = new Mastra({
         method: 'POST',
         requiresAuth: false,
         handler: async (c: any) => {
-          if (!tokenOk(reqToken(c))) return c.json({ error: 'bad token' }, 401);
+          const auth = await l2Auth(c);
+          if (!auth.ok) return c.json({ error: 'bad token' }, 401);
           const body: any = await c.req.json().catch(() => ({}));
           const ref = String(body?.ref ?? '').replace(/^secret:/, '');
           if (!/^vault-[\w-]+$/.test(ref)) return c.json({ error: 'bad payload' }, 400);
           const { d, ready } = db(); await ready;
-          const meta: any = await d.prepare('SELECT name, kind FROM vault_meta WHERE id=?').bind(ref).first();
+          const meta: any = await d.prepare('SELECT name, kind, user_id FROM vault_meta WHERE id=?').bind(ref).first();
           if (!meta) return c.json({ error: 'secret not found or expired' }, 404);
+          // 多租户归属：凭证条目必须属于请求身份的用户；'device' 共享池仅限真实配对设备（共享 token 不给）
+          const ownOk = String(meta.user_id) === String(auth.userId ?? '')
+            || (String(meta.user_id) === 'device' && !!auth.deviceId);
+          if (!ownOk) return c.json({ error: 'secret not found or expired' }, 404);
           // 用户级凭证（mcp-library S2.2/S2.5 授权面签字）：kind=oauth_credential|api_key 是「已连接集成」的
           // 设备级凭证——连接写入与取用同界（设备令牌），不走任务 blob 校验（ref 在本机注册表而非任务文本）。
           // 签字：设备令牌泄露即可取已连集成的短命令牌——与「L2 本就要拿这些令牌调 MCP」同界，属固有暴露面。
@@ -1467,8 +1625,8 @@ export const mastra = new Mastra({
           }
           const taskId = String(body?.taskId ?? '');
           if (!taskId) return c.json({ error: 'bad payload' }, 400);
-          const task: any = await d.prepare('SELECT def_json, instructions, prompt FROM l2_tasks WHERE task_id=?').bind(taskId).first();
-          if (!task) return c.json({ error: 'task not found' }, 404);
+          const task: any = await d.prepare('SELECT def_json, instructions, prompt, owner_id FROM l2_tasks WHERE task_id=?').bind(taskId).first();
+          if (!task || !taskOwned(task, auth)) return c.json({ error: 'task not found' }, 404);
           // 授权面：句柄必须出现在该任务的 def 快照 / 指令 / prompt（request_secret 流把句柄写进 prompt）
           const blob = `${task.def_json ?? ''}\n${task.instructions ?? ''}\n${task.prompt ?? ''}`;
           if (!blob.includes(ref)) return c.json({ error: 'ref not authorized for this task' }, 403);
@@ -1482,11 +1640,12 @@ export const mastra = new Mastra({
         method: 'POST',
         requiresAuth: false,
         handler: async (c: any) => {
-          if (!tokenOk(reqToken(c))) { console.log('[L1] callback REJECTED bad token'); return c.json({ error: 'bad token' }, 401); }
+          const auth = await l2Auth(c);
+          if (!auth.ok) { console.log('[L1] callback REJECTED bad token'); return c.json({ error: 'bad token' }, 401); }
           const task: any = await c.req.json().catch(() => null);
           if (!task?.id || !task?.status?.state) return c.json({ error: 'bad payload' }, 400);
           const { state, text } = extractTask(task);
-          const f = await finalizeTask(String(task.id), state, text, 'callback');
+          const f = await finalizeTask(String(task.id), state, text, 'callback', auth);
           if (f.ignored) return c.json({ ok: true, ignored: f.ignored });
           if (f.compose) { try { c.executionCtx.waitUntil(f.compose); } catch { await f.compose; } }
           return c.json({ ok: true });
@@ -1498,15 +1657,16 @@ export const mastra = new Mastra({
         method: 'POST',
         requiresAuth: false,
         handler: async (c: any) => {
-          if (!tokenOk(reqToken(c))) return c.json({ error: 'bad token' }, 401);
+          const auth = await l2Auth(c);
+          if (!auth.ok) return c.json({ error: 'bad token' }, 401);
           const body: any = await c.req.json().catch(() => ({}));
           const taskId = String(body?.taskId ?? '');
           const kind = String(body?.kind ?? 'note');
           const line = String(body?.line ?? '').trim().slice(0, 120);
           if (!taskId || !line) return c.json({ error: 'bad payload' }, 400);
           const { d, ready } = db(); await ready;
-          const task: any = await d.prepare('SELECT thread_id, state, progress FROM l2_tasks WHERE task_id=?').bind(taskId).first();
-          if (!task) return c.json({ error: 'task not found' }, 404);
+          const task: any = await d.prepare('SELECT thread_id, state, progress, owner_id FROM l2_tasks WHERE task_id=?').bind(taskId).first();
+          if (!task || !taskOwned(task, auth)) return c.json({ error: 'task not found' }, 404);
           if (TERMINAL.includes(String(task.state))) return c.json({ ok: true, stale: true });
           if (String(task.state) !== 'working') return c.json({ error: 'task not claimed' }, 409);
           const now = Date.now();
@@ -1544,9 +1704,11 @@ export const mastra = new Mastra({
           const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
           if (u) {
             const row: any = await d.prepare('SELECT harness FROM user_settings WHERE user_id=?').bind(u.id).first();
-            return c.json({ harness: row?.harness ?? null });
+            // L2 控制台（l2-console S2.5）：附执行引擎目录（只读；安装/检测在桌面端）
+            const catalog = (HCAT ?? []).map((h: any) => ({ id: h.id, name: h.name ?? h.id, description: h.description ?? '', command: h.command ?? '' }));
+            return c.json({ harness: row?.harness ?? null, catalog });
           }
-          if (tokenOk(reqToken(c))) {
+          if ((await l2Auth(c)).ok) {
             const row: any = await d.prepare("SELECT value FROM device_defaults WHERE key='harness'").first();
             return c.json({ harness: row?.value ?? null });
           }
@@ -1572,7 +1734,7 @@ export const mastra = new Mastra({
               .bind(u.id, harness, Date.now()).run();
             return c.json({ harness });
           }
-          if (tokenOk(reqToken(c))) {
+          if ((await l2Auth(c)).ok) {
             // 设备令牌路径（评审 MAJOR）：桌面端上报设备默认
             await d.prepare(`INSERT INTO device_defaults (key, value, updated_at) VALUES ('harness',?,?)
               ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`)
@@ -1596,11 +1758,12 @@ export const mastra = new Mastra({
         requiresAuth: false,
         handler: async (c: any) => {
           const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
-          const device = !u && tokenOk(reqToken(c));
+          const ident = u ? null : await l2Auth(c);
+          const device = !u && !!ident?.ok;
           if (!u && !device) return c.json({ error: 'unauthorized' }, 401);
           const { d, ready } = db(); await ready;
-          // 设备令牌取全部连接（设备级根信任，与 /l2-secret 设备级凭证同界）；会话只取本人
-          const rows = u ? await listConnections(d, u.id) : await listConnections(d, null);
+          // 设备令牌只取本用户连接（多租户归属）；会话取本人；共享 token 无身份不给清单
+          const rows = u ? await listConnections(d, u.id) : ident?.userId ? await listConnections(d, ident.userId) : [];
           return c.json({ ok: true, connections: rows.map(connOut) });
         },
       } as any),
@@ -1766,14 +1929,15 @@ export const mastra = new Mastra({
         method: 'POST',
         requiresAuth: false,
         handler: async (c: any) => {
-          if (!tokenOk(reqToken(c))) return c.json({ error: 'bad token' }, 401);
+          const auth = await l2Auth(c);
+          if (!auth.ok) return c.json({ error: 'bad token' }, 401);
           const body: any = await c.req.json().catch(() => ({}));
           const taskId = String(body?.taskId ?? '');
           const question = String(body?.question ?? '').trim().slice(0, 300);
           if (!taskId || !question) return c.json({ error: 'bad payload' }, 400);
           const { d, ready } = db(); await ready;
-          const task: any = await d.prepare('SELECT thread_id, state, ask_question, ask_answer, ask_count FROM l2_tasks WHERE task_id=?').bind(taskId).first();
-          if (!task) return c.json({ error: 'task not found' }, 404);
+          const task: any = await d.prepare('SELECT thread_id, state, ask_question, ask_answer, ask_count, owner_id FROM l2_tasks WHERE task_id=?').bind(taskId).first();
+          if (!task || !taskOwned(task, auth)) return c.json({ error: 'task not found' }, 404);
           if (TERMINAL.includes(String(task.state))) return c.json({ error: 'task finished' }, 409);
           if (String(task.state) !== 'working') return c.json({ error: 'task not claimed' }, 409);
           const now = Date.now();
@@ -1802,10 +1966,13 @@ export const mastra = new Mastra({
         method: 'POST',
         requiresAuth: false,
         handler: async (c: any) => {
-          if (!tokenOk(reqToken(c))) return c.json({ error: 'bad token' }, 401);
+          const auth = await l2Auth(c);
+          if (!auth.ok) return c.json({ error: 'bad token' }, 401);
           const body: any = await c.req.json().catch(() => ({}));
           const taskId = String(body?.taskId ?? '');
           const { d, ready } = db(); await ready;
+          const chk: any = await d.prepare('SELECT owner_id FROM l2_tasks WHERE task_id=?').bind(taskId).first();
+          if (!chk || !taskOwned(chk, auth)) return c.json({ error: 'task not found' }, 404);
           await d.prepare('UPDATE l2_tasks SET ask_question=NULL WHERE task_id=? AND ask_answer IS NULL').bind(taskId).run();
           return c.json({ ok: true });
         },
@@ -1814,11 +1981,12 @@ export const mastra = new Mastra({
         method: 'GET',
         requiresAuth: false,
         handler: async (c: any) => {
-          if (!tokenOk(reqToken(c))) return c.json({ error: 'bad token' }, 401);
+          const auth = await l2Auth(c);
+          if (!auth.ok) return c.json({ error: 'bad token' }, 401);
           const taskId = c.req.query('taskId') ?? '';
           const { d, ready } = db(); await ready;
-          const task: any = await d.prepare('SELECT ask_answer FROM l2_tasks WHERE task_id=?').bind(taskId).first();
-          if (!task) return c.json({ error: 'task not found' }, 404);
+          const task: any = await d.prepare('SELECT ask_answer, owner_id FROM l2_tasks WHERE task_id=?').bind(taskId).first();
+          if (!task || !taskOwned(task, auth)) return c.json({ error: 'task not found' }, 404);
           return c.json({ answer: task.ask_answer ?? null });
         },
       } as any),
@@ -1827,7 +1995,8 @@ export const mastra = new Mastra({
         method: 'POST',
         requiresAuth: false,
         handler: async (c: any) => {
-          if (!tokenOk(reqToken(c))) return c.json({ error: 'bad token' }, 401);
+          const auth = await l2Auth(c);
+          if (!auth.ok) return c.json({ error: 'bad token' }, 401);
           const body: any = await c.req.json().catch(() => ({}));
           const taskId = String(body?.taskId ?? '');
           const kind = String(body?.kind ?? 'text');
@@ -1839,8 +2008,8 @@ export const mastra = new Mastra({
           if (kind === 'text' && data.length > 8_000) return c.json({ error: 'text too large' }, 413);
           if (kind === 'page' && data.length > 2_000_000) return c.json({ error: 'page too large (>2MB)' }, 413);
           const { d, ready } = db(); await ready;
-          const task: any = await d.prepare('SELECT thread_id, state FROM l2_tasks WHERE task_id=?').bind(taskId).first();
-          if (!task) return c.json({ error: 'task not found' }, 404);
+          const task: any = await d.prepare('SELECT thread_id, state, owner_id FROM l2_tasks WHERE task_id=?').bind(taskId).first();
+          if (!task || !taskOwned(task, auth)) return c.json({ error: 'task not found' }, 404);
           if (TERMINAL.includes(String(task.state))) return c.json({ error: 'task finished' }, 409);
           const id = `art-${crypto.randomUUID()}`;
           await d.prepare('INSERT INTO task_artifacts (id,task_id,kind,caption,data,created_at) VALUES (?,?,?,?,?,?)')
@@ -1849,7 +2018,7 @@ export const mastra = new Mastra({
           try {
             // page：发布到 CF Pages 拿独立可分享 URL（pages-hosting S2.2 通道 A），房间消息用 [page:id]
             if (kind === 'page') {
-              const pub = await publishPage(E as any, { html: data, title: caption || '页面', taskId, roomId: task.thread_id, userId: null });
+              const pub = await publishPage(E as any, { html: data, title: caption || '页面', taskId, roomId: task.thread_id, userId: task.owner_id ?? null });
               await d.prepare('INSERT INTO messages (id,room_id,user_id,role,content,created_at) VALUES (?,?,?,?,?,?)')
                 .bind(msgId, task.thread_id, null, 'assistant',
                   pub ? `[page:${pub.id}] ${caption || '页面'}｜${pub.url}` : `[artifact:${id}] ${caption || '页面'}（发布失败，仅存档）`, Date.now()).run();
@@ -1874,8 +2043,16 @@ export const mastra = new Mastra({
           const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
           if (!u) return c.json({ error: 'unauthorized' }, 401);
           const { d, ready } = db(); await ready;
-          const row: any = await d.prepare('SELECT kind, caption, data FROM task_artifacts WHERE id=?').bind(String(c.req.param('id') ?? '')).first();
+          const row: any = await d.prepare(`SELECT a.kind, a.caption, a.data, t.owner_id, t.thread_id
+            FROM task_artifacts a LEFT JOIN l2_tasks t ON t.task_id=a.task_id WHERE a.id=?`).bind(String(c.req.param('id') ?? '')).first();
           if (!row) return c.json({ error: 'not found' }, 404);
+          // 归属（多租户）：任务 owner 或所在房间成员才可读
+          if (String(row.owner_id ?? '') !== String(u.id)) {
+            const m = row.thread_id
+              ? await d.prepare('SELECT 1 AS x FROM room_members WHERE room_id=? AND user_id=?').bind(String(row.thread_id), String(u.id)).first()
+              : null;
+            if (!m) return c.json({ error: 'not found' }, 404);
+          }
           if (row.kind === 'image') {
             const b64 = String(row.data).replace(/^data:image\/\w+;base64,/, '');
             return new Response(Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0)), {
@@ -2154,6 +2331,12 @@ const schedulesTick = async () => {
           .bind((await computeNextRunAtSafe(rec, Date.now())), rec.id, rec.next_run_at).run();
         if (!claimed?.meta?.changes) continue;
         try { await advanceSchedule(d, rec.id, Date.now()); } catch {}
+        // 计量点①补口（计费绕过修复）：例程触发的 L1 回合同价计费（allowOverage 记账不拦截，对齐「主会话不硬锁死」）
+        if (rec.user_id) {
+          try {
+            await chargeQuota(d, String(rec.user_id), { kind: 'pool', units: 1, idempotencyKey: `turn:sched:${rec.id}:${rec.next_run_at}`, detail: '定时例程回合', allowOverage: true });
+          } catch (e: any) { console.log('[quota] sched charge failed', String(e?.message ?? e).slice(0, 120)); }
+        }
         const threadId = String(rec.target_id ?? '');
         const prompt = `【定时任务：${rec.name}】${rec.prompt}`;
         const msgs = await withThreadBlock([{ role: 'user', content: prompt }], threadId);

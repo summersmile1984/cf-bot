@@ -2,7 +2,7 @@
 
 PC desktop app (Tauri 2 + TypeScript): **interactive chat UI** + **L2 agent runtime** in one install.
 
-- **Chat**: embeds live L1 SPA at `{L1_URL}/app` (soft light product UI).
+- **Chat**: embeds live L1 SPA at `{L1_URL}/app`（/app 与根路径同壳，桌面内嵌专用）.
 - **L2 panel**: start/stop claim loop, last claim / ACP|CUA kind, queue hint.
 - **Settings**: L1 URL + device token → `~/.config/mastra-l2/device.json`.
 - **Runtime**: claims from `POST /l2-claim`, runs ACP (`dsh --profile acp` via `runAcpPrompt`) or CUA (`cua` CLI), pushes `POST /a2a-callback`.
@@ -27,16 +27,9 @@ npm install
 # optional: regenerate platform icons from icons/icon.png
 # npx tauri icon src-tauri/icons/icon.png
 
-# pair device (token is the same secret as Worker PUSH_TOKEN — do not commit)
-mkdir -p ~/.config/mastra-l2
-cat > ~/.config/mastra-l2/device.json <<'JSON'
-{
-  "l1Url": "http://localhost:4120",
-  "token": "YOUR_DEVICE_TOKEN",
-  "intervalMs": 2000
-}
-JSON
-
+# pair device: web「管理 → 设备」生成配对码 → 在本应用 Settings 填码点「配对这台电脑」
+# （配对后自动写 ~/.config/mastra-l2/device.json：deviceId + 设备 token，可单独吊销；
+#   也可手工置 token=L2_DEVICE_TOKEN / PUSH_TOKEN 老路径）
 npm run tauri:dev
 ```
 

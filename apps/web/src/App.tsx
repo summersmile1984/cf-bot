@@ -8,6 +8,7 @@ import { Chat } from './components/Chat';
 import { SettingsPanel } from './components/SettingsPanel';
 import { McpPage } from './components/McpPage';
 import { MemoryPage } from './components/MemoryPage';
+import { L2Page } from './components/L2Page';
 
 export function App() {
   const [me, setMe] = useState<User | null>(null);
@@ -17,11 +18,12 @@ export function App() {
   const [members, setMembers] = useState<Member[]>([]);
   const [roomName, setRoomName] = useState('');
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [view, setView] = useState<'chat' | 'mcp' | 'memory'>('chat');
+  const [view, setView] = useState<'chat' | 'mcp' | 'memory' | 'l2'>('chat');
   const [mcpTab, setMcpTab] = useState<'market' | 'mine'>('market');
   const [mcpToast, setMcpToast] = useState<string | null>(null);
   const [productName, setProductName] = useState('cf-bot');
   const [onboarding, setOnboarding] = useState<'checking' | 'setup' | 'ready'>('checking');
+  const [tsSitekey, setTsSitekey] = useState<string | null>(null);
 
   // 产品名（白牌化）：公开接口拉取，标题/登录页统一使用
   useEffect(() => {
@@ -32,7 +34,10 @@ export function App() {
   // 首跑向导（onboarding）：无用户时强制进 /setup
   useEffect(() => {
     getOnboardingStatus()
-      .then((s) => setOnboarding(s.needsSetup ? 'setup' : 'ready'))
+      .then((s) => {
+        setTsSitekey(s.turnstileSitekey ?? null);
+        setOnboarding(s.needsSetup ? 'setup' : 'ready');
+      })
       .catch(() => setOnboarding('ready'));
   }, []);
   useEffect(() => {
@@ -135,6 +140,7 @@ export function App() {
     return (
       <Login
         productName={productName}
+        turnstileSitekey={tsSitekey}
         onDone={async () => {
           const u = await getSession();
           setMe(u);
@@ -167,6 +173,7 @@ export function App() {
         onOpenSettings={() => setSettingsOpen(true)}
         onOpenMcp={() => setView('mcp')}
         onOpenMemory={() => setView('memory')}
+        onOpenL2={() => setView('l2')}
       />
       {mcpToast && (
         <div className="fixed left-1/2 top-4 z-[60] -translate-x-1/2 rounded-full border border-[var(--color-line)] bg-[var(--color-bg)] px-5 py-2 text-sm shadow-lg">
@@ -178,6 +185,8 @@ export function App() {
         <McpPage key={mcpTab} initialTab={mcpTab} />
       ) : view === 'memory' ? (
         <MemoryPage />
+      ) : view === 'l2' ? (
+        <L2Page onClose={() => setView('chat')} />
       ) : activeId ? (
         <Chat
           key={activeId}
