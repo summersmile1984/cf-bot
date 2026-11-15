@@ -106,11 +106,13 @@ try {
     const vb = Object.fromEntries((root.vectorize ?? []).map((v) => [v.binding, v.index_name]));
     w.vectorize = w.vectorize.map((v) => ({ ...v, index_name: vb[v.binding] ?? v.index_name }));
   }
-  for (const k of ['L1_PUBLIC_URL', 'CLOUDFLARE_ACCOUNT_ID', 'VAULT_STORE_ID', 'TURNSTILE_SITEKEY']) {
+  for (const k of ['L1_PUBLIC_URL', 'CLOUDFLARE_ACCOUNT_ID', 'VAULT_STORE_ID', 'TURNSTILE_SITEKEY', 'VAPID_PUBLIC_KEY', 'MAIL_PROVIDER', 'MAIL_FROM']) {
     if (root?.vars?.[k]) w.vars[k] = root.vars[k];
   }
   // 注册限流 binding（saas S2.7）：根配置声明，产物原样带上（wrangler 字段名是 ratelimits）
   if (Array.isArray(root?.ratelimits) && root.ratelimits.length) w.ratelimits = root.ratelimits;
+  // CF Email Service 发信绑定（account-hardening S2.1）：根配置声明，产物原样带上
+  if (Array.isArray(root?.send_email) && root.send_email.length) w.send_email = root.send_email;
 } catch { /* 无根配置或解析失败：用兜底值 */ }
 writeFileSync(f, JSON.stringify(w, null, 2));
 console.log('[cf-postbuild] assets -> ./static, main -> ./worker-entry.mjs, DO ROOM_DO, AI + VECTORIZE + queues(om-cycles)');

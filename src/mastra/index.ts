@@ -50,6 +50,10 @@ import { ensureProfileTable, upsertProfile, resolveUserByName, loadRoomProfileBl
 import { ensurePersonaConfig, getPersona, updatePersona, personaBlock, buildThreadBlock, buildModelId, SEED_MODEL_ID } from './persona';
 import { indexThreadMessages } from './index-messages';
 import { ensureVaultTable, createVaultEntry, createOAuthCredential, listVaultEntries, deleteVaultEntry, getVaultEntry, getVaultValue, getOAuthAccessToken, vaultOut, purgeExpiredVault } from './vault';
+import { ensureNotificationTables, notifyUser, listNotifications, unreadCount, markNotificationsRead, getEmailPrefs, patchEmailPrefs } from './notifications';
+import { ensureDecisionTables, createDecision, answerDecision, declineDecision, answerDecisionForTask, cancelDecisionsForTask, expireDueDecisions, listDecisions, pendingCount } from './decisions';
+import { savePushSubscription, removePushSubscription } from './push';
+import { agentMetadata, agentJwks } from './pap';
 import { ensureAgentDefs, listExperts, resolveExpert, createExpert, updateExpert, deleteExpert, expertOut, validateExpertDef } from './experts';
 import harnessesJson from '../l2/harnesses.json';
 import mcpCatalogJson from '../l2/mcp-catalog.json';
@@ -106,6 +110,7 @@ function db() {
       user_id TEXT PRIMARY KEY, auto_review INTEGER NOT NULL DEFAULT 1, updated_at INTEGER NOT NULL)`).run())
     .then(() => d.prepare('ALTER TABLE user_settings ADD COLUMN harness TEXT').run().catch(() => null))
     .then(() => d.prepare('ALTER TABLE user_settings ADD COLUMN oauth_clients TEXT').run().catch(() => null))
+    .then(() => d.prepare('ALTER TABLE user_settings ADD COLUMN notification_prefs TEXT').run().catch(() => null))
     .then(() => d.prepare('CREATE TABLE IF NOT EXISTS device_defaults (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER NOT NULL)').run())
     .then(() => d.prepare(`CREATE TABLE IF NOT EXISTS schedules (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, cron TEXT NOT NULL,
@@ -826,6 +831,18 @@ const finalizeTask = async (taskId: string, state: string, text: string, src: st
   const u = await d.prepare(`UPDATE l2_tasks SET state=?, result=?, updated_at=? WHERE task_id=? AND state NOT IN ('completed','failed','canceled','rejected')`)
     .bind(state, text.slice(0, 20000), Date.now(), taskId).run();
   if (!TERMINAL.includes(state) || !u?.meta?.changes) return {};
+  // 任务终态 → 通知 + 待办收尾（notifications / approvals-hub）
+  try {
+    if (rec.owner_id) {
+      await cancelDecisionsForTask(d, taskId);
+      await notifyUser(d, {
+        userId: String(rec.owner_id), kind: state === 'completed' ? 'task.completed' : 'task.failed',
+        title: state === 'completed' ? '后台任务完成' : '后台任务未成功',
+        body: String(rec.prompt ?? '').slice(0, 100) || null,
+        link: `room:${rec.thread_id}`, refType: 'task', refId: taskId,
+      }, E);
+    }
+  } catch (e: any) { console.log('[notify] finalize failed', String(e?.message ?? e).slice(0, 120)); }
   // 退补（saas S2.4）：失败/取消/拒绝按幂等键退回长任务分
   if (state !== 'completed') {
     try {
@@ -897,6 +914,17 @@ export const mastra = new Mastra({
           const p = await getPersona(d);
           return c.json({ productName: p.product_name });
         },
+      } as any),
+      // PAP（pap-client T1）：CIMD 身份元文档 + JWKS（公开；client_id 必须等于本文件 URL）
+      registerApiRoute('/agent/pap.json', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => c.json(agentMetadata(E as any, publicBase())),
+      } as any),
+      registerApiRoute('/agent/jwks.json', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => c.json(await agentJwks(E as any)),
       } as any),
       // 首跑引导（onboarding）：状态检测 / 建管 / 注册开关
       registerApiRoute('/onboarding/status', {
@@ -1951,6 +1979,19 @@ export const mastra = new Mastra({
             return c.json({ error: 'question already pending' }, 409);
           }
           const clean = sanitizeProgress(question);
+          // 审批中心（approvals-hub S2.1）：决策请求落库 + 通知（task_ask / permission_ask 同通道，body.kind 区分）
+          try {
+            const owner = String(task.owner_id ?? auth.userId ?? '');
+            if (owner) {
+              const dk = String(body?.kind ?? '') === 'permission_ask' ? 'permission_ask' : 'task_ask';
+              await createDecision(d, { userId: owner, kind: dk as any, refId: taskId, roomId: task.thread_id, question: clean });
+              await notifyUser(d, {
+                userId: owner, kind: 'decision.requested',
+                title: dk === 'permission_ask' ? '需要你拍板：权限确认' : '需要你拍板：任务追问',
+                body: clean, link: `room:${task.thread_id}`, refType: 'decision', refId: taskId,
+              }, E);
+            }
+          } catch (e: any) { console.log('[decision] create failed', String(e?.message ?? e).slice(0, 120)); }
           const msgId = `msg-${crypto.randomUUID()}`;
           try {
             await d.prepare('INSERT INTO messages (id,room_id,user_id,role,content,created_at) VALUES (?,?,?,?,?,?)')
@@ -1973,7 +2014,7 @@ export const mastra = new Mastra({
           const { d, ready } = db(); await ready;
           const chk: any = await d.prepare('SELECT owner_id FROM l2_tasks WHERE task_id=?').bind(taskId).first();
           if (!chk || !taskOwned(chk, auth)) return c.json({ error: 'task not found' }, 404);
-          await d.prepare('UPDATE l2_tasks SET ask_question=NULL WHERE task_id=? AND ask_answer IS NULL').bind(taskId).run();
+          await cancelDecisionsForTask(d, taskId);
           return c.json({ ok: true });
         },
       } as any),
@@ -2073,6 +2114,123 @@ export const mastra = new Mastra({
           return c.json({ quota: await getQuota(d, u.id) });
         },
       } as any),
+      // 通知中心（notifications S2.3）：列表 / 未读数 / 已读
+      registerApiRoute('/notifications', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db(); await ready;
+          return c.json({
+            items: await listNotifications(d, u.id, Number(c.req.query('limit') ?? 30)),
+            unread: await unreadCount(d, u.id),
+            vapidPublicKey: (E as any).VAPID_PUBLIC_KEY ? String((E as any).VAPID_PUBLIC_KEY) : null,
+          });
+        },
+      } as any),
+      registerApiRoute('/notifications/read', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const { d, ready } = db(); await ready;
+          const n = await markNotificationsRead(d, u.id, body?.all ? 'all' : Array.isArray(body?.ids) ? body.ids : []);
+          return c.json({ ok: true, read: n });
+        },
+      } as any),
+      // 通知偏好（notifications S2.3）：邮件渠道按事件类型开关
+      registerApiRoute('/settings/notifications', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db(); await ready;
+          return c.json({ prefs: await getEmailPrefs(d, u.id) });
+        },
+      } as any),
+      registerApiRoute('/settings/notifications', {
+        method: 'PUT',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const { d, ready } = db(); await ready;
+          await patchEmailPrefs(d, u.id, body?.prefs ?? {});
+          return c.json({ ok: true, prefs: await getEmailPrefs(d, u.id) });
+        },
+      } as any),
+      // 待办/审批中心（approvals-hub S2.3）：列表 / 回答 / 拒绝
+      registerApiRoute('/decisions', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db(); await ready;
+          const status = c.req.query('status') || undefined;
+          return c.json({ items: await listDecisions(d, u.id, { status: status as any }), pending: await pendingCount(d, u.id) });
+        },
+      } as any),
+      registerApiRoute('/decisions/:id/answer', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const id = String(c.req.param('id') ?? '');
+          const { d, ready } = db(); await ready;
+          if (body?.decline) {
+            const r = await declineDecision(d, u.id, id);
+            if (!r.ok) return c.json({ error: 'not pending or not found' }, 404);
+            // fail-closed 回写：拒绝即给 L2 明确否定（权限钩子按「拒绝」放弃）
+            if (r.row?.ref_id) {
+              await d.prepare('UPDATE l2_tasks SET ask_answer=? WHERE task_id=? AND ask_answer IS NULL')
+                .bind('主人拒绝：请停止该动作并在总结中说明', String(r.row.ref_id)).run().catch(() => null);
+            }
+            return c.json({ ok: true, status: 'declined' });
+          }
+          const answer = String(body?.answer ?? '').trim().slice(0, 2000);
+          if (!answer) return c.json({ error: 'bad payload' }, 400);
+          const r = await answerDecision(d, u.id, id, answer);
+          if (!r.ok) return c.json({ error: 'not pending or not found' }, 404);
+          if (r.row?.ref_id) {
+            await d.prepare('UPDATE l2_tasks SET ask_answer=? WHERE task_id=? AND ask_answer IS NULL')
+              .bind(answer, String(r.row.ref_id)).run().catch(() => null);
+          }
+          return c.json({ ok: true, status: 'answered' });
+        },
+      } as any),
+      // Web Push 订阅（notifications T4）：浏览器 PushManager 订阅落库 / 退订
+      registerApiRoute('/push/subscribe', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const { d, ready } = db(); await ready;
+          const r = await savePushSubscription(d, u.id, body ?? {});
+          return r.ok ? c.json({ ok: true }) : c.json({ error: r.reason ?? 'bad subscription' }, 400);
+        },
+      } as any),
+      registerApiRoute('/push/unsubscribe', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const { d, ready } = db(); await ready;
+          await removePushSubscription(d, u.id, String(body?.endpoint ?? ''));
+          return c.json({ ok: true });
+        },
+      } as any),
       // 订阅与收款（saas S2.5）：Paddle webhook / 结账 / 订阅查询
       registerApiRoute('/webhooks/paddle', {
         method: 'POST',
@@ -2095,6 +2253,10 @@ export const mastra = new Mastra({
         handler: async (c: any) => {
           const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
           if (!u) return c.json({ error: 'unauthorized' }, 401);
+          // 付费墙前置邮箱验证（account-hardening S2.2）：订阅与找回关键，必须真实邮箱
+          if (u.emailVerified === false) {
+            return c.json({ error: 'email_not_verified', message: '请先在 设置→账号 验证邮箱后再订阅' }, 403);
+          }
           const body: any = await c.req.json().catch(() => ({}));
           const priceKey = String(body?.priceKey ?? '');
           if (!/^(lite|pro|max|credit_1000|cloud_60)$/.test(priceKey)) return c.json({ error: 'bad priceKey' }, 400);
@@ -2186,6 +2348,7 @@ export const mastra = new Mastra({
                 const answer = raw.replace(/^【[^】]*】\s*/, '').slice(0, 2000);
                 if (answer) {
                   await d.prepare('UPDATE l2_tasks SET ask_answer=? WHERE task_id=? AND ask_answer IS NULL').bind(answer, t.task_id).run();
+                  await answerDecisionForTask(d, t.task_id, answer);
                   const ack = `收到你的答复（针对：${sanitizeProgress(String(t.ask_question).slice(0, 40))}），已转给任务继续。`;
                   const stream = new ReadableStream<string>({
                     start(controller) { controller.enqueue(ack); controller.close(); },
@@ -2323,6 +2486,17 @@ const schedulesTick = async () => {
     await ready;
     try { await purgeExpiredVault(E, d); } catch {}
     try { await purgeOAuthStates(d); } catch {}
+    // 待办过期（approvals-hub S2.2）：fail-closed——过期按拒绝处理，清挂起提问并发通知
+    try {
+      const expired = await expireDueDecisions(d);
+      for (const dc of expired as any[]) {
+        if (dc.ref_id) await d.prepare('UPDATE l2_tasks SET ask_question=NULL WHERE task_id=? AND ask_answer IS NULL').bind(String(dc.ref_id)).run().catch(() => null);
+        await notifyUser(d, {
+          userId: String(dc.user_id), kind: 'decision.expired', title: '待办已过期（按拒绝处理）',
+          body: String(dc.question ?? '').slice(0, 120), link: 'decisions', refType: 'decision', refId: String(dc.id),
+        }, E);
+      }
+    } catch (e: any) { console.log('[decision] expire failed', String(e?.message ?? e).slice(0, 120)); }
     const due = await dueSchedules(d, Date.now());
     for (const rec of due as any[]) {
       try {

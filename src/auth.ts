@@ -5,6 +5,8 @@
  */
 import { betterAuth } from 'better-auth';
 import { drizzleAdapter } from 'better-auth/adapters/drizzle';
+import { sendMail, renderMail } from './mastra/mail';
+import { getPersona } from './mastra/persona';
 import { drizzle } from 'drizzle-orm/d1';
 import * as schema from './db/schema';
 
@@ -57,7 +59,35 @@ export function getAuth(E: AuthEnv, requestOrigin?: string) {
   if (requestOrigin && !trusted.includes(requestOrigin)) trusted.push(requestOrigin);
   const auth = betterAuth({
     database: drizzleAdapter(db, { provider: 'sqlite', schema, usePlural: false }),
-    emailAndPassword: { enabled: true, minPasswordLength: 8 },
+    emailAndPassword: {
+      enabled: true,
+      minPasswordLength: 8,
+      // 重置 token 30 分钟一次性（account-hardening S2.3）
+      resetPasswordTokenExpiresIn: 1800,
+      // 找回密码（account-hardening S2.3）：限时链接（token 30 分钟、一次性）；SPA 自绘表单，链接直带 token
+      sendResetPassword: async ({ user, token }: any) => {
+        const p: any = await getPersona(E.DB).catch(() => ({ product_name: 'cf-bot' }));
+        const brand = String(p?.product_name || 'cf-bot');
+        const link = `${baseURL.replace(/\/$/, '')}/?reset_token=${encodeURIComponent(token)}`;
+        const m = renderMail({ productName: brand, title: '重置你的登录密码', body: '点击按钮重置登录密码，30 分钟内有效。如果不是你本人操作，忽略本邮件即可。', ctaLabel: '重置密码', ctaUrl: link });
+        await sendMail(E, { to: String(user.email), subject: `【${brand}】重置密码`, html: m.html, text: m.text, tag: 'reset' });
+      },
+      // 重置后旧会话全部失效（account-hardening S2.3）：防盗号残留
+      onPasswordReset: async ({ user }: any) => {
+        try { await E.DB.prepare('DELETE FROM session WHERE user_id=?').bind(String(user.id)).run(); } catch {}
+      },
+    },
+    // 邮箱验证（account-hardening S2.2）：注册即发信、不锁体验；付费墙前置验证
+    emailVerification: {
+      sendOnSignUp: true,
+      expiresIn: 86400, // 24h（实测默认 TTL 偏短，用户来不及点）
+      sendVerificationEmail: async ({ user, url }: any) => {
+        const p: any = await getPersona(E.DB).catch(() => ({ product_name: 'cf-bot' }));
+        const brand = String(p?.product_name || 'cf-bot');
+        const m = renderMail({ productName: brand, title: '验证你的邮箱', body: '点击按钮完成邮箱验证，用于账号找回与订阅通知。', ctaLabel: '验证邮箱', ctaUrl: String(url) });
+        await sendMail(E, { to: String(user.email), subject: `【${brand}】验证邮箱`, html: m.html, text: m.text, tag: 'verify' });
+      },
+    },
     // 防刷（saas S2.7）：注册/登录限频，撞库与批量注册受限
     rateLimit: {
       window: 60,
@@ -79,7 +109,7 @@ export function getAuth(E: AuthEnv, requestOrigin?: string) {
   return auth;
 }
 
-export type SessionUser = { id: string; email: string; name?: string };
+export type SessionUser = { id: string; email: string; name?: string; emailVerified?: boolean };
 
 /** 把 Request | HonoRequestLike | {headers} 规整成标准 Headers。 */
 function toHeaders(req: Request | { headers?: any; header?: (n: string) => string | undefined }): Headers {
@@ -109,7 +139,7 @@ export async function getSessionUser(req: Request | { headers?: any; header?: (n
     // disableRefresh：读路径不走会话滚动续期（updateSession 写），否则并发读会竞态
     // 抛 FAILED_TO_GET_SESSION（401）——实测 8 并发 6 失败；读接口无需续期
     const s: any = await (auth.api as any).getSession({ headers, query: { disableRefresh: true } });
-    if (s?.user?.id) return { id: String(s.user.id), email: String(s.user.email ?? ''), name: s.user.name ? String(s.user.name) : undefined };
+    if (s?.user?.id) return { id: String(s.user.id), email: String(s.user.email ?? ''), name: s.user.name ? String(s.user.name) : undefined, emailVerified: !!s?.user?.emailVerified };
     return null;
   } catch (e: any) {
     console.log('[auth] getSession error', String(e?.message ?? e).slice(0, 120));

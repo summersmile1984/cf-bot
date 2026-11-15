@@ -1,6 +1,6 @@
 /** API 客户端：better-auth + rooms/messages + SSE 流。同源 cookie 会话。 */
 
-export type User = { id: string; email: string; name?: string };
+export type User = { id: string; email: string; name?: string; emailVerified?: boolean };
 export type Room = {
   id: string;
   name: string;
@@ -94,6 +94,65 @@ export async function signUp(name: string, email: string, password: string, turn
 
 export async function signOut(): Promise<void> {
   await fetch('/auth/sign-out', jsonInit('POST')).catch(() => {});
+}
+
+// ---------- 账号安全（account-hardening S2.2-S2.4） ----------
+export type SessionRow = {
+  token: string; userAgent?: string | null; ipAddress?: string | null;
+  createdAt: number; updatedAt?: number; expiresAt?: number;
+};
+
+export async function sendVerificationEmail(email: string): Promise<void> {
+  const r = await fetch('/auth/send-verification-email', { ...jsonInit('POST', { email, callbackURL: '/' }), credentials: 'same-origin' });
+  if (!r.ok) throw new Error('send failed');
+}
+
+export async function verifyEmailByToken(token: string): Promise<void> {
+  const r = await fetch(`/auth/verify-email?token=${encodeURIComponent(token)}&callbackURL=${encodeURIComponent('/')}`, {
+    credentials: 'same-origin',
+    redirect: 'manual',
+  });
+  // 302/200 都视为已处理（成功回跳 /；失败回跳 /?error=…）；真实结果以下游会话为准
+  if (r.status >= 500) throw new Error('verify failed');
+}
+
+export async function forgetPassword(email: string): Promise<void> {
+  const r = await fetch('/auth/request-password-reset', { ...jsonInit('POST', { email, redirectTo: '/' }), credentials: 'same-origin' });
+  if (!r.ok) throw new Error('send failed');
+}
+
+export async function resetPassword(token: string, password: string): Promise<void> {
+  const r = await fetch('/auth/reset-password', { ...jsonInit('POST', { token, newPassword: password }), credentials: 'same-origin' });
+  const j: any = await r.json().catch(() => null);
+  if (!r.ok) throw new Error(String(j?.message ?? j?.code ?? 'reset failed'));
+}
+
+export async function listSessions(): Promise<SessionRow[]> {
+  const r = await fetch('/auth/list-sessions', { credentials: 'same-origin' });
+  const j: any = await r.json().catch(() => null);
+  return Array.isArray(j) ? j : (j?.sessions ?? []);
+}
+
+export async function revokeSession(token: string): Promise<void> {
+  const r = await fetch('/auth/revoke-session', { ...jsonInit('POST', { token }), credentials: 'same-origin' });
+  if (!r.ok) throw new Error('revoke failed');
+}
+
+export async function revokeOtherSessions(): Promise<void> {
+  const r = await fetch('/auth/revoke-other-sessions', { ...jsonInit('POST', {}), credentials: 'same-origin' });
+  if (!r.ok) throw new Error('revoke failed');
+}
+
+export async function getNotificationPrefs(): Promise<Record<string, boolean>> {
+  const r = await fetch('/settings/notifications', { credentials: 'same-origin' });
+  const j: any = await r.json().catch(() => null);
+  return j?.prefs ?? {};
+}
+
+export async function patchNotificationPrefs(prefs: Record<string, boolean>): Promise<Record<string, boolean>> {
+  const r = await fetch('/settings/notifications', { ...jsonInit('PUT', { prefs }), credentials: 'same-origin' });
+  const j: any = await r.json().catch(() => null);
+  return j?.prefs ?? {};
 }
 
 // ---------- rooms ----------
@@ -384,6 +443,54 @@ export async function completeSetup(input: { name?: string; email: string; passw
 
 export async function setRegistration(open: boolean): Promise<{ ok: boolean; reason?: string }> {
   const r = await fetch('/settings/registration', { ...jsonInit('PUT', { open }), credentials: 'same-origin' });
+  return j(r);
+}
+
+// ---------- 通知与待办（notifications / approvals-hub） ----------
+export type NotificationItem = {
+  id: string; kind: string; title: string; body?: string | null; link?: string | null;
+  ref_type?: string | null; ref_id?: string | null; status: 'unread' | 'read'; count: number; created_at: number;
+};
+export type DecisionItem = {
+  id: string; kind: string; ref_id?: string | null; room_id?: string | null; question: string;
+  status: 'pending' | 'answered' | 'declined' | 'expired' | 'canceled'; answer?: string | null;
+  created_at: number; expires_at: number; decided_at?: number | null;
+};
+
+export async function getNotifications(limit = 30): Promise<{ items: NotificationItem[]; unread: number; vapidPublicKey?: string | null }> {
+  const r = await fetch(`/notifications?limit=${limit}`, { credentials: 'same-origin' });
+  return j(r);
+}
+
+export async function pushSubscribe(sub: { endpoint: string; keys?: { p256dh?: string; auth?: string } }): Promise<void> {
+  const r = await fetch('/push/subscribe', { ...jsonInit('POST', sub), credentials: 'same-origin' });
+  if (!r.ok) throw new Error('subscribe failed');
+}
+
+export async function pushUnsubscribe(endpoint: string): Promise<void> {
+  await fetch('/push/unsubscribe', { ...jsonInit('POST', { endpoint }), credentials: 'same-origin' }).catch(() => {});
+}
+
+export async function markNotificationsRead(ids?: string[] | 'all'): Promise<void> {
+  const r = await fetch('/notifications/read', {
+    ...jsonInit('POST', ids === 'all' ? { all: true } : { ids: ids ?? [] }),
+    credentials: 'same-origin',
+  });
+  return j(r);
+}
+
+export async function getDecisions(status?: string): Promise<{ items: DecisionItem[]; pending: number }> {
+  const r = await fetch(`/decisions${status ? `?status=${encodeURIComponent(status)}` : ''}`, { credentials: 'same-origin' });
+  return j(r);
+}
+
+export async function answerDecision(id: string, answer: string): Promise<void> {
+  const r = await fetch(`/decisions/${encodeURIComponent(id)}/answer`, { ...jsonInit('POST', { answer }), credentials: 'same-origin' });
+  return j(r);
+}
+
+export async function declineDecision(id: string): Promise<void> {
+  const r = await fetch(`/decisions/${encodeURIComponent(id)}/answer`, { ...jsonInit('POST', { decline: true }), credentials: 'same-origin' });
   return j(r);
 }
 

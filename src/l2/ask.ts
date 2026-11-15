@@ -10,13 +10,13 @@ export type AskCfg = { l1Url: string; token: string };
 const POLL_MS = 5_000;
 const TIMEOUT_MS = 3 * 60_000; // 串行执行位防饿死（评审 MAJOR）
 
-/** 抛出问题并阻塞等待主人房间回复（超时给兜底语，任务不挂死）。 */
-export function l2Asker(cfg: AskCfg, taskId: string): (question: string) => Promise<string> {
-  return async (question: string) => {
+/** 抛出问题并阻塞等待主人房间回复（超时给兜底语，任务不挂死）。kind：task_ask（默认）| permission_ask（权限审批） */
+export function l2Asker(cfg: AskCfg, taskId: string): (question: string, kind?: string) => Promise<string> {
+  return async (question: string, kind?: string) => {
     const post = await fetch(`${cfg.l1Url}/l2-ask`, withProxy({
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${cfg.token}`, 'x-a2a-notification-token': cfg.token },
-      body: JSON.stringify({ taskId, question: String(question).slice(0, 300) }),
+      body: JSON.stringify({ taskId, question: String(question).slice(0, 300), kind: kind ?? 'task_ask' }),
       signal: AbortSignal.timeout(15_000),
     })).catch(() => null);
     if (!post?.ok) {

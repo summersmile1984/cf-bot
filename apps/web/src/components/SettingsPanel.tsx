@@ -1,13 +1,17 @@
 import { useEffect, useState } from 'react';
-import type { Persona } from '../lib/api';
-import { getModels, getPersona, updatePersona, getOnboardingStatus, setRegistration } from '../lib/api';
+import type { Persona, SessionRow, User } from '../lib/api';
+import { getModels, getPersona, updatePersona, getOnboardingStatus, setRegistration, sendVerificationEmail, listSessions, revokeSession, revokeOtherSessions, getNotificationPrefs, patchNotificationPrefs } from '../lib/api';
 
 export function SettingsPanel({
   onClose,
   onSuccess,
+  me,
+  onEnablePush,
 }: {
   onClose: () => void;
   onSuccess: (p: Persona) => void;
+  me?: User | null;
+  onEnablePush?: () => void;
 }) {
   const [name, setName] = useState('');
   const [role, setRole] = useState('');
@@ -26,6 +30,10 @@ export function SettingsPanel({
   const [gateways, setGateways] = useState<{ gateway: string; models: string[] }[]>([]);
   const [effortLevels, setEffortLevels] = useState<string[]>([]);
   const [signupsOpen, setSignupsOpen] = useState(false);
+  const [sessions, setSessions] = useState<SessionRow[]>([]);
+  const [secMsg, setSecMsg] = useState('');
+  const [notifPerm, setNotifPerm] = useState<string>(typeof Notification !== 'undefined' ? Notification.permission : 'unsupported');
+  const [mailPrefs, setMailPrefs] = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
@@ -53,7 +61,16 @@ export function SettingsPanel({
       .catch(() => setErr('加载配置失败，请稍后重试'))
       .finally(() => setLoading(false));
     getOnboardingStatus().then((s) => setSignupsOpen(s.signupsOpen)).catch(() => {});
+    listSessions().then(setSessions).catch(() => {});
+    getNotificationPrefs().then(setMailPrefs).catch(() => {});
   }, []);
+
+  const toggleMailGroup = async (kinds: string[], on: boolean) => {
+    const patch: Record<string, boolean> = {};
+    for (const k of kinds) patch[k] = on;
+    setMailPrefs((m) => ({ ...m, ...patch }));
+    try { setMailPrefs(await patchNotificationPrefs(patch)); } catch { /* 保留乐观值，下次打开自愈 */ }
+  };
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -282,6 +299,121 @@ export function SettingsPanel({
                 className="h-4 w-4"
               />
             </label>
+
+            <div className="mb-4 mt-6 border-t border-[var(--color-line)] pt-4">
+              <p className="text-sm font-semibold">账号与安全</p>
+              <p className="text-xs text-[var(--color-mut)]">邮箱验证、登录会话与桌面通知</p>
+            </div>
+            <div className="mb-3 flex items-center justify-between rounded-xl border border-[var(--color-line)] px-3 py-2.5">
+              <div>
+                <span className="text-sm">邮箱验证</span>
+                <p className="text-xs text-[var(--color-mut)]">
+                  {me?.emailVerified ? `${me.email} · 已验证` : '未验证（订阅前需完成验证）'}
+                </p>
+              </div>
+              {!me?.emailVerified && (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    setSecMsg('');
+                    try {
+                      await sendVerificationEmail(me?.email ?? '');
+                      setSecMsg('验证邮件已发出，请查收');
+                    } catch {
+                      setSecMsg('发送失败，请稍后再试');
+                    }
+                  }}
+                  className="rounded-full border border-[var(--color-line)] px-3 py-1 text-xs text-[var(--color-mut)] hover:text-[var(--color-fg)]"
+                >
+                  发验证邮件
+                </button>
+              )}
+            </div>
+            <div className="mb-3 rounded-xl border border-[var(--color-line)] px-3 py-2.5">
+              <div className="flex items-center justify-between">
+                <span className="text-sm">登录会话（{sessions.length}）</span>
+                {sessions.length > 1 && (
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      try { await revokeOtherSessions(); setSessions(await listSessions()); setSecMsg('其他会话已全部下线'); } catch { setSecMsg('操作失败'); }
+                    }}
+                    className="rounded-full border border-[var(--color-line)] px-3 py-1 text-xs text-[var(--color-mut)] hover:text-red-500"
+                  >
+                    其他全部下线
+                  </button>
+                )}
+              </div>
+              <div className="mt-2 space-y-1">
+                {sessions.slice(0, 8).map((s) => (
+                  <div key={s.token} className="flex items-center justify-between gap-2 text-xs text-[var(--color-mut)]">
+                    <span className="truncate">{(s.userAgent ?? '未知设备').slice(0, 48)} · {new Date(s.createdAt).toLocaleDateString()}</span>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        try { await revokeSession(s.token); setSessions(await listSessions()); } catch { setSecMsg('下线失败'); }
+                      }}
+                      className="shrink-0 hover:text-red-500"
+                    >
+                      下线
+                    </button>
+                  </div>
+                ))}
+                {sessions.length === 0 && <p className="text-xs text-[var(--color-mut)]">暂无其他登录记录</p>}
+              </div>
+              <p className="mt-2 text-[11px] text-[var(--color-mut)]">登录会话是「看得到聊天的入口」，与「执行设备」（跑任务的电脑）分开管理。</p>
+            </div>
+            <div className="mb-5 flex items-center justify-between rounded-xl border border-[var(--color-line)] px-3 py-2.5">
+              <div>
+                <span className="text-sm">桌面/浏览器通知</span>
+                <p className="text-xs text-[var(--color-mut)]">
+                  {{ granted: '已开启', denied: '已拒绝（需在系统设置里改）', default: '未授权', unsupported: '当前环境不支持' }[notifPerm] ?? notifPerm}
+                </p>
+              </div>
+              {notifPerm === 'default' && (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      const p = await Notification.requestPermission();
+                      setNotifPerm(p);
+                      if (p === 'granted') {
+                        setSecMsg('已开启桌面通知');
+                        await onEnablePush?.();
+                      }
+                    } catch { setSecMsg('开启失败'); }
+                  }}
+                  className="rounded-full border border-[var(--color-line)] px-3 py-1 text-xs text-[var(--color-mut)] hover:text-[var(--color-fg)]"
+                >
+                  开启
+                </button>
+              )}
+            </div>
+            <div className="mb-3 flex items-center justify-between rounded-xl border border-[var(--color-line)] px-3 py-2.5">
+              <div>
+                <span className="text-sm">决策提醒邮件</span>
+                <p className="text-xs text-[var(--color-mut)]">拍板请求与过期提醒发到邮箱</p>
+              </div>
+              <input
+                type="checkbox"
+                checked={mailPrefs['decision.requested'] !== false && mailPrefs['decision.expired'] !== false}
+                onChange={(e) => toggleMailGroup(['decision.requested', 'decision.expired'], e.target.checked)}
+                className="h-4 w-4"
+              />
+            </div>
+            <div className="mb-5 flex items-center justify-between rounded-xl border border-[var(--color-line)] px-3 py-2.5">
+              <div>
+                <span className="text-sm">额度与账单邮件</span>
+                <p className="text-xs text-[var(--color-mut)]">额度预警/耗尽与订阅欠费提醒</p>
+              </div>
+              <input
+                type="checkbox"
+                checked={mailPrefs['quota.low'] !== false && mailPrefs['quota.empty'] !== false && mailPrefs['subscription.past_due'] !== false}
+                onChange={(e) => toggleMailGroup(['quota.low', 'quota.empty', 'subscription.past_due'], e.target.checked)}
+                className="h-4 w-4"
+              />
+            </div>
+            {secMsg && <p className="mb-4 text-xs text-[var(--color-acc)]">{secMsg}</p>}
 
             <div className="mb-4 mt-6 border-t border-[var(--color-line)] pt-4">
               <p className="text-sm font-semibold">模型设置</p>

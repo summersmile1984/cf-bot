@@ -1,13 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
-import { signIn, signUp } from '../lib/api';
+import { signIn, signUp, forgetPassword } from '../lib/api';
 
 export function Login({ onDone, productName = 'cf-bot', turnstileSitekey }: { onDone: () => void; productName?: string; turnstileSitekey?: string | null }) {
-  const [mode, setMode] = useState<'in' | 'up'>('in');
+  const [mode, setMode] = useState<'in' | 'up' | 'forgot'>('in');
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
+  const [sent, setSent] = useState(false);
   const [tsToken, setTsToken] = useState('');
   const tsRef = useRef<HTMLDivElement>(null);
   const tsWidget = useRef<string | null>(null);
@@ -50,11 +51,17 @@ export function Login({ onDone, productName = 'cf-bot', turnstileSitekey }: { on
     }
     setBusy(true);
     try {
+      if (mode === 'forgot') {
+        await forgetPassword(email);
+        setSent(true);
+        return;
+      }
       if (mode === 'in') await signIn(email, password);
       else await signUp(name || email.split('@')[0], email, password, tsToken || undefined);
       onDone();
     } catch (e: any) {
-      setErr(mode === 'in' ? '登录失败，请检查邮箱和密码' : '注册失败，邮箱可能已存在');
+      if (mode === 'forgot') setErr('发送失败，请稍后再试');
+      else setErr(mode === 'in' ? '登录失败，请检查邮箱和密码' : '注册失败，邮箱可能已存在');
       if (mode === 'up' && tsWidget.current) {
         const w = window as any;
         try { w.turnstile?.reset(tsWidget.current); } catch {}
@@ -73,9 +80,24 @@ export function Login({ onDone, productName = 'cf-bot', turnstileSitekey }: { on
       >
         <h1 className="mb-1 text-xl font-semibold">{productName}</h1>
         <p className="mb-6 text-sm text-[var(--color-mut)]">
-          {mode === 'in' ? '登录以进入你的房间' : '创建一个账号'}
+          {mode === 'in' ? '登录以进入你的房间' : mode === 'up' ? '创建一个账号' : '找回密码'}
         </p>
 
+        {sent && mode === 'forgot' ? (
+          <>
+            <p className="mb-4 text-sm text-[var(--color-mut)]">
+              如果该邮箱已注册，重置链接已发出（30 分钟内有效），请查收邮件。
+            </p>
+            <button
+              type="button"
+              onClick={() => { setMode('in'); setSent(false); setErr(''); }}
+              className="w-full rounded-full bg-[var(--color-fg)] py-2.5 font-medium text-[var(--color-bg)]"
+            >
+              返回登录
+            </button>
+          </>
+        ) : (
+          <>
         {mode === 'up' && (
           <label className="mb-3 block">
             <span className="mb-1 block text-xs text-[var(--color-mut)]">昵称</span>
@@ -98,6 +120,7 @@ export function Login({ onDone, productName = 'cf-bot', turnstileSitekey }: { on
             className="w-full rounded-xl border border-[var(--color-line)] bg-[var(--color-bg)] px-3 py-2 outline-none focus:border-[var(--color-acc)]"
           />
         </label>
+        {mode !== 'forgot' && (
         <label className="mb-5 block">
           <span className="mb-1 block text-xs text-[var(--color-mut)]">密码</span>
           <input
@@ -110,6 +133,7 @@ export function Login({ onDone, productName = 'cf-bot', turnstileSitekey }: { on
             className="w-full rounded-xl border border-[var(--color-line)] bg-[var(--color-bg)] px-3 py-2 outline-none focus:border-[var(--color-acc)]"
           />
         </label>
+        )}
 
         {err && <p className="mb-3 text-sm text-red-500">{err}</p>}
 
@@ -120,8 +144,18 @@ export function Login({ onDone, productName = 'cf-bot', turnstileSitekey }: { on
           disabled={busy}
           className="w-full rounded-full bg-[var(--color-fg)] py-2.5 font-medium text-[var(--color-bg)] disabled:opacity-50"
         >
-          {busy ? '请稍候…' : mode === 'in' ? '登录' : '注册'}
+          {busy ? '请稍候…' : mode === 'forgot' ? '发送重置链接' : mode === 'in' ? '登录' : '注册'}
         </button>
+
+        {mode === 'in' && (
+          <button
+            type="button"
+            onClick={() => { setMode('forgot'); setErr(''); }}
+            className="mt-3 w-full text-center text-xs text-[var(--color-mut)] hover:text-[var(--color-fg)]"
+          >
+            忘记密码？
+          </button>
+        )}
 
         <button
           type="button"
@@ -129,10 +163,12 @@ export function Login({ onDone, productName = 'cf-bot', turnstileSitekey }: { on
             setMode(mode === 'in' ? 'up' : 'in');
             setErr('');
           }}
-          className="mt-4 w-full text-center text-sm text-[var(--color-mut)] hover:text-[var(--color-fg)]"
+          className={`w-full text-center text-sm text-[var(--color-mut)] hover:text-[var(--color-fg)] ${mode === 'in' ? 'mt-2' : 'mt-4'}`}
         >
           {mode === 'in' ? '没有账号？去注册' : '已有账号？去登录'}
         </button>
+          </>
+        )}
       </form>
     </div>
   );

@@ -37,7 +37,7 @@ export const a2aLog: any[] = [];
 export const log = (msg: string, extra: any = {}) => { const x = JSON.parse(redactKnownSecrets(JSON.stringify(extra))); const e = { at: new Date().toISOString(), msg, ...x }; a2aLog.push(e); if (a2aLog.length > 500) a2aLog.shift(); console.log('[A2A]', msg, JSON.stringify(x).slice(0, 300)); };
 
 /** Run one real prompt through the ACP harness (dsh) and return its final text. */
-export async function runAcpPrompt(prompt: string, runtime: Runtime, extraEnv?: Record<string, string>, opts?: { harness?: string; policies?: Record<string, string>; ask?: (q: string) => Promise<string> }): Promise<string> {
+export async function runAcpPrompt(prompt: string, runtime: Runtime, extraEnv?: Record<string, string>, opts?: { harness?: string; policies?: Record<string, string>; ask?: (q: string, kind?: string) => Promise<string> }): Promise<string> {
   const prof = acpProfile(runtime, opts?.harness);
   if (process.env.ACP_DRY_RUN === '1') return `[DRY-RUN，非真实执行] ${prompt}`;
   if (!commandExists(prof.command)) throw new Error(`ACP harness 命令不存在：${prof.command}（检查 PATH / ACP_COMMAND；或临时 ACP_DRY_RUN=1）`);
@@ -74,7 +74,7 @@ export async function runAcpPrompt(prompt: string, runtime: Runtime, extraEnv?: 
         log('perm ask without ask channel -> deny', { label });
         return { outcome: { outcome: 'cancelled' } };
       }
-      const ans = String((await opts.ask(`权限确认：任务要执行「${label}」，允许还是拒绝？（回复 允许 / 拒绝）`).catch(() => '')) ?? '').trim();
+      const ans = String((await opts.ask(`权限确认：任务要执行「${label}」，允许还是拒绝？（回复 允许 / 拒绝）`, 'permission_ask').catch(() => '')) ?? '').trim();
       const allow = /允许|可以|同意|继续|^y(es)?$/i.test(ans) && !/拒绝|不行|不要|^n(o)?$/i.test(ans);
       log('perm ask answered', { label, allow, ans: ans.slice(0, 40) });
       return allow ? pickAllow() : { outcome: { outcome: 'cancelled' } };

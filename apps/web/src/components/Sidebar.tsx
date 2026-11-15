@@ -1,5 +1,7 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { Room, User } from '../lib/api';
+import { getDecisions } from '../lib/api';
+import { NotificationsBell } from './NotificationsBell';
 
 function initials(name?: string | null) {
   const s = (name ?? '').trim();
@@ -72,6 +74,8 @@ export function Sidebar({
   onOpenMcp,
   onOpenMemory,
   onOpenL2,
+  onOpenDecisions,
+  onNavigate,
 }: {
   rooms: Room[];
   activeId: string | null;
@@ -83,7 +87,22 @@ export function Sidebar({
   onOpenMcp: () => void;
   onOpenMemory: () => void;
   onOpenL2: () => void;
+  onOpenDecisions: () => void;
+  onNavigate: (link: string) => void;
 }) {
+  const [pendingDecisions, setPendingDecisions] = useState(0);
+  useEffect(() => {
+    let alive = true;
+    const tick = async () => {
+      try {
+        const r = await getDecisions();
+        if (alive) setPendingDecisions(r.pending ?? 0);
+      } catch { /* 静默 */ }
+    };
+    tick();
+    const t = setInterval(tick, 30_000);
+    return () => { alive = false; clearInterval(t); };
+  }, []);
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState('');
 
@@ -104,8 +123,9 @@ export function Sidebar({
 
   return (
     <aside className="flex w-[280px] shrink-0 flex-col border-r border-[var(--color-line)] bg-[var(--color-side)]">
-      <div className="px-4 pt-5">
+      <div className="flex items-center justify-between px-4 pt-5">
         <h1 className="text-[17px] font-semibold">房间</h1>
+        <NotificationsBell onNavigate={onNavigate} />
       </div>
 
       <div className="thin-scroll mt-4 flex-1 overflow-y-auto">
@@ -197,6 +217,17 @@ export function Sidebar({
           <div className="truncate text-xs font-medium">{me.name || me.email}</div>
           <div className="truncate text-[11px] text-[var(--color-mut)]">{me.email}</div>
         </div>
+        <button
+          onClick={onOpenDecisions}
+          className="relative rounded-full border border-[var(--color-line)] px-2.5 py-1 text-xs text-[var(--color-mut)] hover:text-[var(--color-fg)]"
+        >
+          待办
+          {pendingDecisions > 0 && (
+            <span className="absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-semibold text-white">
+              {pendingDecisions > 99 ? '99+' : pendingDecisions}
+            </span>
+          )}
+        </button>
         <button
           onClick={onOpenMcp}
           className="rounded-full border border-[var(--color-line)] px-2.5 py-1 text-xs text-[var(--color-mut)] hover:text-[var(--color-fg)]"
