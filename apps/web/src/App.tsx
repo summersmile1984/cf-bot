@@ -11,6 +11,8 @@ import { McpPage } from './components/McpPage';
 import { MemoryPage } from './components/MemoryPage';
 import { L2Page } from './components/L2Page';
 import { DecisionsPage } from './components/DecisionsPage';
+import { TasksPage } from './components/TasksPage';
+import { NotificationsBell } from './components/NotificationsBell';
 
 export function App() {
   const [me, setMe] = useState<User | null>(null);
@@ -20,13 +22,15 @@ export function App() {
   const [members, setMembers] = useState<Member[]>([]);
   const [roomName, setRoomName] = useState('');
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [view, setView] = useState<'chat' | 'mcp' | 'memory' | 'l2' | 'decisions'>('chat');
+  const [view, setView] = useState<'chat' | 'mcp' | 'memory' | 'l2' | 'decisions' | 'tasks'>('chat');
   const [mcpTab, setMcpTab] = useState<'market' | 'mine'>('market');
   const [mcpToast, setMcpToast] = useState<string | null>(null);
   const [productName, setProductName] = useState('cf-bot');
   const [onboarding, setOnboarding] = useState<'checking' | 'setup' | 'ready'>('checking');
   const [tsSitekey, setTsSitekey] = useState<string | null>(null);
   const [resetToken, setResetToken] = useState<string | null>(null);
+  const [navOpen, setNavOpen] = useState(false);
+  const [prefill, setPrefill] = useState<string | null>(null);
 
   // 站内深链（通知/待办共用）：room:<id> / decisions / settings
   const navigateLink = useCallback((link: string) => {
@@ -70,10 +74,16 @@ export function App() {
     const p = new URLSearchParams(location.search);
     const rv = p.get('reset_token');
     const vf = p.get('verify_token');
-    if (rv || vf) {
-      p.delete('reset_token'); p.delete('verify_token');
+    const taskDraft = p.get('task');
+    if (rv || vf || taskDraft) {
+      p.delete('reset_token'); p.delete('verify_token'); p.delete('task');
       const q = p.toString();
       history.replaceState(null, '', `${location.pathname}${q ? `?${q}` : ''}`);
+    }
+    if (taskDraft) {
+      // 网页交办草稿交 Chat 一次性消费（sessionStorage：房间切换重挂不重复填）
+      try { sessionStorage.setItem('taskPrefill', taskDraft.slice(0, 8000)); } catch { /* 静默 */ }
+      setPrefill(taskDraft.slice(0, 8000));
     }
     if (rv) setResetToken(rv);
     if (vf) {
@@ -178,6 +188,18 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [me?.id]);
 
+  // 网页交办草稿（browser-ext S2.2）：切主会话并预填输入框（不自动发送）
+  useEffect(() => {
+    if (!prefill || !rooms.length) return;
+    const main = rooms.find((r) => r.is_main === 1) ?? rooms[0];
+    if (main) {
+      setView('chat');
+      setActiveId(main.id);
+      setRoomName(main.name);
+    }
+    setPrefill(null);
+  }, [prefill, rooms]);
+
   // 当前房间成员
   useEffect(() => {
     if (!activeId) return;
@@ -247,10 +269,27 @@ export function App() {
 
   return (
     <div className="flex h-full overflow-hidden">
+      {/* 移动顶栏（mobile-web S2.1）：汉堡 + 视图名 + 通知铃；桌面无此栏 */}
+      <div className="fixed inset-x-0 top-0 z-20 flex h-13 items-center gap-3 border-b border-[var(--color-line)] bg-[var(--color-side)] px-3 py-2.5 md:hidden">
+        <button
+          aria-label="菜单"
+          onClick={() => setNavOpen(true)}
+          className="flex h-9 w-9 items-center justify-center rounded-full border border-[var(--color-line)] text-[var(--color-mut)]"
+        >
+          ☰
+        </button>
+        <div className="min-w-0 flex-1 truncate text-sm font-medium">
+          {view === 'chat' ? (roomName || '房间') : { mcp: 'MCP', memory: '记忆', l2: '管理', decisions: '待办', tasks: '任务' }[view]}
+        </div>
+        <NotificationsBell onNavigate={(l) => { navigateLink(l); setNavOpen(false); }} />
+      </div>
+      {navOpen && <div className="fixed inset-0 z-30 bg-black/40 md:hidden" onClick={() => setNavOpen(false)} />}
       <Sidebar
         rooms={rooms}
         activeId={activeId}
         me={me}
+        open={navOpen}
+        onClose={() => setNavOpen(false)}
         onSelect={(id) => {
           setView('chat');
           setActiveId(id);
@@ -264,6 +303,7 @@ export function App() {
         onOpenMemory={() => setView('memory')}
         onOpenL2={() => setView('l2')}
         onOpenDecisions={() => setView('decisions')}
+        onOpenTasks={() => setView('tasks')}
         onNavigate={navigateLink}
       />
       {mcpToast && (
@@ -272,6 +312,7 @@ export function App() {
           <button className="ml-3 text-[var(--color-mut)]" onClick={() => setMcpToast(null)}>✕</button>
         </div>
       )}
+      <div className="flex min-w-0 flex-1 flex-col pt-[52px] md:pt-0">
       {view === 'mcp' ? (
         <McpPage key={mcpTab} initialTab={mcpTab} />
       ) : view === 'memory' ? (
@@ -280,6 +321,8 @@ export function App() {
         <L2Page onClose={() => setView('chat')} />
       ) : view === 'decisions' ? (
         <DecisionsPage onNavigate={navigateLink} onClose={() => setView('chat')} />
+      ) : view === 'tasks' ? (
+        <TasksPage onNavigate={navigateLink} onClose={() => setView('chat')} />
       ) : activeId ? (
         <Chat
           key={activeId}
@@ -301,6 +344,7 @@ export function App() {
           选择或新建一个房间
         </div>
       )}
+      </div>
       {settingsOpen && (
         <SettingsPanel
           onClose={() => setSettingsOpen(false)}

@@ -41,6 +41,7 @@ export type Message = {
   user_id: string | null;
   role: 'user' | 'assistant' | 'system';
   content: string;
+  model?: string | null;
   created_at: number;
 };
 
@@ -443,6 +444,72 @@ export async function completeSetup(input: { name?: string; email: string; passw
 
 export async function setRegistration(open: boolean): Promise<{ ok: boolean; reason?: string }> {
   const r = await fetch('/settings/registration', { ...jsonInit('PUT', { open }), credentials: 'same-origin' });
+  return j(r);
+}
+
+// ---------- 资料/知识库（file-knowledge） ----------
+export type UserFile = { id: string; room_id?: string | null; name: string; kind: string; size: number; status: string; created_at: number };
+
+export async function getFiles(): Promise<UserFile[]> {
+  const r = await fetch('/files', { credentials: 'same-origin' });
+  const j: any = await r.json().catch(() => null);
+  return j?.files ?? [];
+}
+
+export async function uploadFile(input: { name: string; content: string; kind?: string; roomId?: string | null }): Promise<{ ok: boolean; id?: string; error?: string }> {
+  const r = await fetch('/files', { ...jsonInit('POST', input), credentials: 'same-origin' });
+  const j: any = await r.json().catch(() => null);
+  return r.ok ? { ok: true, id: j?.id } : { ok: false, error: j?.error ?? '上传失败' };
+}
+
+export async function deleteFile(id: string): Promise<void> {
+  const r = await fetch(`/files/${encodeURIComponent(id)}`, { method: 'DELETE', credentials: 'same-origin' });
+  if (!r.ok) throw new Error('delete failed');
+}
+
+// ---------- Skill 市场（skill-market） ----------
+export type ExpertTemplate = { key: string; name: string; description: string; instructions: string; model?: string | null };
+
+export async function getExpertTemplates(): Promise<ExpertTemplate[]> {
+  const r = await fetch('/agent-defs/templates', { credentials: 'same-origin' });
+  const j: any = await r.json().catch(() => null);
+  return j?.templates ?? [];
+}
+
+export async function importExpert(payload: Partial<AgentDef>): Promise<AgentDef> {
+  const r = await fetch('/agent-defs/import', { ...jsonInit('POST', payload), credentials: 'same-origin' });
+  const j: any = await r.json().catch(() => null);
+  if (!r.ok) throw new Error(String(j?.error ?? '导入失败'));
+  return j.expert;
+}
+
+// ---------- 任务历史（task-history） ----------
+export type TaskRow = {
+  taskId: string; prompt: string; kind: string; status: string; runtime?: string | null;
+  roomId: string; roomName?: string | null; deviceId?: string | null; deviceName?: string | null;
+  createdAt: number; updatedAt: number; quotaPoints: number; artifacts: number;
+  decision?: string | null; link: string;
+};
+export type TaskDetail = {
+  task: { taskId: string; prompt: string; kind: string; status: string; runtime?: string | null; roomId: string; deviceId?: string | null; createdAt: number; updatedAt: number; progress: Array<Record<string, unknown>>; result?: string | null };
+  artifacts: Array<{ id: string; kind: string; caption?: string | null }>;
+  decisions: Array<{ id: string; kind: string; status: string; question: string; answer?: string | null; created_at: number }>;
+  ledger: Array<{ idempotency_key: string; entry: string; units: number; detail?: string | null; created_at: number }>;
+};
+
+export async function getTasks(params: { status?: string; device?: string; room?: string; limit?: number } = {}): Promise<TaskRow[]> {
+  const q = new URLSearchParams();
+  if (params.status) q.set('status', params.status);
+  if (params.device) q.set('device', params.device);
+  if (params.room) q.set('room', params.room);
+  if (params.limit) q.set('limit', String(params.limit));
+  const r = await fetch(`/tasks${q.toString() ? `?${q}` : ''}`, { credentials: 'same-origin' });
+  const j: any = await r.json().catch(() => null);
+  return j?.items ?? [];
+}
+
+export async function getTaskDetail(taskId: string): Promise<TaskDetail> {
+  const r = await fetch(`/tasks/${encodeURIComponent(taskId)}`, { credentials: 'same-origin' });
   return j(r);
 }
 

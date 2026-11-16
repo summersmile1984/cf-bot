@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "cf-bot 交办助手",
+  "version": "0.1.0",
+  "description": "把当前网页/选中内容一键交给 cf-bot 秘书（打开已登录站点预填任务草稿）",
+  "permissions": ["activeTab", "contextMenus", "storage"],
+  "action": {
+    "default_title": "把这页交给秘书",
+    "default_icon": "icons/icon128.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "options_page": "options.html",
+  "icons": {
+    "128": "icons/icon128.png"
+  }
+}

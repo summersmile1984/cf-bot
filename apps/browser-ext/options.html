@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>cf-bot 交办助手 · 设置</title>
+    <style>
+      body { font: 14px/1.6 -apple-system, 'PingFang SC', sans-serif; margin: 24px; color: #222; }
+      label { display: block; margin-bottom: 8px; }
+      input { width: 100%; max-width: 420px; padding: 8px 10px; border: 1px solid #ddd; border-radius: 8px; }
+      button { margin-top: 12px; padding: 8px 16px; border: 0; border-radius: 999px; background: #111; color: #fff; cursor: pointer; }
+      .hint { color: #888; font-size: 12px; margin-top: 10px; }
+    </style>
+  </head>
+  <body>
+    <h1 style="font-size: 16px">cf-bot 交办助手</h1>
+    <label>
+      秘书站点地址（L1）
+      <input id="l1" type="url" placeholder="http://localhost:4120" />
+    </label>
+    <button id="save">保存</button>
+    <p class="hint">自部署用户改成自己的域名；默认是官方托管地址。保存后立即生效。</p>
+    <script src="options.js"></script>
+  </body>
+</html>

@@ -14,6 +14,23 @@ function Bubble({ m, members, me }: { m: Message; members: Member[]; me: User })
   const isSelf = isUser && m.user_id === me.id;
   const sender = members.find((x) => x.user_id === m.user_id);
   const label = isUser ? (isSelf ? '我' : sender?.name || sender?.email || '成员') : '助手';
+  const [speaking, setSpeaking] = useState(false);
+  // 回复播报（voice S2.2）：系统默认音色；长文截 300 字；新朗读 cancel 旧的
+  const speak = () => {
+    try {
+      const synth = window.speechSynthesis;
+      if (!synth) return;
+      if (speaking) { synth.cancel(); setSpeaking(false); return; }
+      synth.cancel();
+      const text = String(m.content ?? '').replace(/\[(?:page|artifact):[^\]]*\][^\n]*/g, '').slice(0, 300);
+      if (!text.trim()) return;
+      const u = new SpeechSynthesisUtterance(text);
+      u.onend = () => setSpeaking(false);
+      u.onerror = () => setSpeaking(false);
+      synth.speak(u);
+      setSpeaking(true);
+    } catch { setSpeaking(false); }
+  };
 
   return (
     <div className={`flex gap-2.5 ${isSelf ? 'justify-end' : ''}`}>
@@ -27,7 +44,23 @@ function Bubble({ m, members, me }: { m: Message; members: Member[]; me: User })
         </div>
       )}
       <div className={`max-w-[78%] ${isSelf ? 'items-end' : 'items-start'} flex flex-col`}>
-        <div className="mb-0.5 px-1 text-[11px] text-[var(--color-mut)]">{label}</div>
+        <div className="mb-0.5 flex items-center gap-1.5 px-1 text-[11px] text-[var(--color-mut)]">
+          {label}
+          {!isUser && m.model && (
+            <span className="rounded bg-[var(--color-line)] px-1 text-[10px]" title={m.model}>
+              ⚡ {String(m.model).split('/').pop()}
+            </span>
+          )}
+          {!isUser && typeof window !== 'undefined' && window.speechSynthesis && (
+            <button
+              onClick={speak}
+              title={speaking ? '停止朗读' : '朗读这条'}
+              className="opacity-60 hover:opacity-100"
+            >
+              {speaking ? '⏹' : '🔊'}
+            </button>
+          )}
+        </div>
         <div
           className={`whitespace-pre-wrap break-words rounded-[18px] px-3.5 py-2.5 ${
             isSelf
@@ -102,6 +135,46 @@ export function Chat({
 }) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
+  // 网页交办草稿（browser-ext S2.2）：一次性消费 sessionStorage 预填（不自动发送）
+  useEffect(() => {
+    try {
+      const draft = sessionStorage.getItem('taskPrefill');
+      if (draft) {
+        sessionStorage.removeItem('taskPrefill');
+        setInput(draft);
+      }
+    } catch { /* 静默 */ }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const [listening, setListening] = useState(false);
+  const [voiceHint, setVoiceHint] = useState('');
+  const recogRef = useRef<any>(null);
+  // 语音输入（voice S2.1）：按住说话，Web Speech 本机识别；不支持的浏览器按钮隐藏
+  const startVoice = () => {
+    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SR) return;
+    try {
+      const r = new SR();
+      r.lang = navigator.language || 'zh-CN';
+      r.interimResults = false;
+      r.continuous = false;
+      r.onresult = (e: any) => {
+        const t = e?.results?.[0]?.[0]?.transcript ?? '';
+        if (t) setInput((prev) => (prev ? `${prev} ${t}` : t));
+      };
+      r.onend = () => setListening(false);
+      r.onerror = () => setListening(false);
+      recogRef.current = r;
+      r.start();
+      setListening(true);
+      if (!localStorage.getItem('voiceHintShown')) {
+        localStorage.setItem('voiceHintShown', '1');
+        setVoiceHint('语音在本机识别，不会上传');
+        setTimeout(() => setVoiceHint(''), 4000);
+      }
+    } catch { setListening(false); }
+  };
+  const stopVoice = () => { try { recogRef.current?.stop?.(); } catch {} setListening(false); };
   const [busy, setBusy] = useState(false);
   const [streaming, setStreaming] = useState('');
   const [invite, setInvite] = useState('');
@@ -129,9 +202,17 @@ export function Chat({
       const freshIds = new Set(fresh.map((x) => x.id));
       const kept = prev.filter((x) => !freshIds.has(x.id));
       for (const s of fresh) {
-        const idx = kept.findIndex(
-          (x) => (x.id.startsWith('local-') || x.id.startsWith('a-')) && x.role === s.role && x.content === s.content,
-        );
+        const idx = kept.findIndex((x) => {
+          if (!(x.id.startsWith('local-') || x.id.startsWith('a-')) || x.role !== s.role) return false;
+          if (x.content === s.content) return true;
+          // 分层回复的乐观副本是全文、服务端存的是结论行——按前缀近似去重，保服务端行（带模型章）
+          if (x.role === 'assistant') {
+            const a = x.content.slice(0, 40);
+            const b = String(s.content ?? '').slice(0, 40);
+            return a && b && (x.content.startsWith(s.content) || s.content.startsWith(x.content) || a === b);
+          }
+          return false;
+        });
         if (idx >= 0) kept.splice(idx, 1);
       }
       return [...kept, ...fresh];
@@ -198,20 +279,25 @@ export function Chat({
   }, [roomId]);
 
   // 加载 + 轮询（降级梯度：WS 健康 15s 安全网，断开 4s 兜底）（S2.4）
+  const fetchOnceRef = useRef<() => void>(() => {});
   useEffect(() => {
     let stop = false;
     let timer: number | undefined;
-    async function poll() {
+    async function fetchOnce() {
       try {
         const { messages: fresh, busy: b } = await listMessages(roomId, lastIdRef.current || undefined);
         if (stop) return;
         mergeMessages(fresh);
         setBusy(b);
       } catch {}
+    }
+    async function poll() {
+      await fetchOnce();
       if (!stop) timer = window.setTimeout(poll, wsHealthyRef.current ? 15000 : 4000);
     }
     setMessages([]);
     lastIdRef.current = '';
+    fetchOnceRef.current = () => { void fetchOnce(); };
     poll();
     return () => {
       stop = true;
@@ -249,6 +335,8 @@ export function Chat({
             { id: `a-${Date.now()}`, room_id: roomId, user_id: null, role: 'assistant', content, created_at: Date.now() },
           ];
         });
+        // 服务端行带 model（模型章）；收尾即拉一次，近似去重会把乐观副本换成真身
+        window.setTimeout(() => fetchOnceRef.current?.(), 400);
       },
       onError: (e) => {
         setStreaming('');
@@ -277,7 +365,7 @@ export function Chat({
 
   return (
     <div className="flex min-w-0 flex-1 flex-col">
-      <header className="flex items-center gap-3 border-b border-[var(--color-line)] px-6 py-3.5">
+      <header className="flex items-center gap-3 border-b border-[var(--color-line)] px-4 md:px-6 py-3.5">
         <div className="flex h-9 w-9 items-center justify-center rounded-full bg-[var(--color-acc)] text-sm font-semibold text-white">
           {initials(roomName)}
         </div>
@@ -302,9 +390,9 @@ export function Chat({
           </button>
         </form>
       </header>
-      {inviteMsg && <div className="px-6 pt-2 text-xs text-[var(--color-mut)]">{inviteMsg}</div>}
+      {inviteMsg && <div className="px-4 md:px-6 pt-2 text-xs text-[var(--color-mut)]">{inviteMsg}</div>}
 
-      <div id="thread" className="thin-scroll flex-1 overflow-y-auto px-6 py-5">
+      <div id="thread" className="thin-scroll flex-1 overflow-y-auto px-4 md:px-6 py-5">
         <div className="mx-auto flex max-w-[760px] flex-col gap-3">
           {messages.length === 0 && !streaming && (
             <div className="py-12 text-center text-sm text-[var(--color-mut)]">
@@ -339,7 +427,7 @@ export function Chat({
         </div>
       </div>
 
-      <footer className="px-6 pb-6">
+      <footer className="px-4 md:px-6 pb-6">
         {quota && (() => {
           const total = quota.weekPool.total + Math.max(0, quota.credits.balance);
           const used = quota.weekPool.used;
@@ -369,13 +457,37 @@ export function Chat({
             </div>
           );
         })()}
-        <form onSubmit={send} className="mx-auto flex max-w-[760px] items-center gap-2 rounded-3xl border border-[var(--color-line)] bg-[var(--color-bg)] py-2 pl-5 pr-2">
-          <input
+        {voiceHint && (
+          <div className="mx-auto mb-2 max-w-[760px] text-center text-xs text-[var(--color-mut)]">{voiceHint}</div>
+        )}
+        <form onSubmit={send} className="mx-auto flex max-w-[760px] items-center gap-2 rounded-3xl border border-[var(--color-line)] bg-[var(--color-bg)] py-2 pl-4 pr-2 md:pl-5">
+          <textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                (e.currentTarget.closest('form') as HTMLFormElement | null)?.requestSubmit();
+              }
+            }}
+            rows={1}
             placeholder="发消息…"
-            className="flex-1 bg-transparent text-[var(--color-fg)] outline-none"
+            className="max-h-32 flex-1 resize-none bg-transparent text-base leading-6 text-[var(--color-fg)] outline-none md:text-[15px]"
           />
+          {typeof window !== 'undefined' && ((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition) && (
+            <button
+              type="button"
+              onPointerDown={(e) => { e.preventDefault(); startVoice(); }}
+              onPointerUp={stopVoice}
+              onPointerLeave={() => { if (listening) stopVoice(); }}
+              title="按住说话"
+              className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full border transition-colors ${
+                listening ? 'border-red-400 bg-red-500/15 text-red-500' : 'border-[var(--color-line)] text-[var(--color-mut)] hover:text-[var(--color-fg)]'
+              }`}
+            >
+              🎤
+            </button>
+          )}
           <button
             type="submit"
             disabled={!input.trim()}

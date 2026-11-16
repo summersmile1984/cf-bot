@@ -75,7 +75,10 @@ export function Sidebar({
   onOpenMemory,
   onOpenL2,
   onOpenDecisions,
+  onOpenTasks,
   onNavigate,
+  open = true,
+  onClose,
 }: {
   rooms: Room[];
   activeId: string | null;
@@ -88,9 +91,15 @@ export function Sidebar({
   onOpenMemory: () => void;
   onOpenL2: () => void;
   onOpenDecisions: () => void;
+  onOpenTasks: () => void;
   onNavigate: (link: string) => void;
+  open?: boolean;
+  onClose?: () => void;
 }) {
   const [pendingDecisions, setPendingDecisions] = useState(0);
+  // 移动端抽屉：选中即收起
+  const pick = (id: string) => { onSelect(id); onClose?.(); };
+  const nav = (fn: () => void) => { fn(); onClose?.(); };
   useEffect(() => {
     let alive = true;
     const tick = async () => {
@@ -122,10 +131,10 @@ export function Sidebar({
   }
 
   return (
-    <aside className="flex w-[280px] shrink-0 flex-col border-r border-[var(--color-line)] bg-[var(--color-side)]">
+    <aside className={`flex w-[280px] shrink-0 flex-col border-r border-[var(--color-line)] bg-[var(--color-side)] max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-40 max-md:w-[85vw] max-md:max-w-[320px] max-md:transition-transform max-md:duration-200 ${open ? '' : 'max-md:-translate-x-full'}`}>
       <div className="flex items-center justify-between px-4 pt-5">
         <h1 className="text-[17px] font-semibold">房间</h1>
-        <NotificationsBell onNavigate={onNavigate} />
+        <NotificationsBell onNavigate={(l) => { onNavigate(l); onClose?.(); }} />
       </div>
 
       <div className="thin-scroll mt-4 flex-1 overflow-y-auto">
@@ -136,7 +145,7 @@ export function Sidebar({
               room={mainRoom}
               active={activeId === mainRoom.id}
               avatar="秘"
-              onSelect={onSelect}
+              onSelect={pick}
             />
           </>
         )}
@@ -150,7 +159,7 @@ export function Sidebar({
                 room={r}
                 active={activeId === r.id}
                 avatar={initials(r.name)}
-                onSelect={onSelect}
+                onSelect={pick}
               />
             ))}
           </>
@@ -189,7 +198,7 @@ export function Sidebar({
             room={r}
             active={activeId === r.id}
             avatar={initials(r.name)}
-            onSelect={onSelect}
+            onSelect={pick}
           />
         ))}
 
@@ -202,14 +211,14 @@ export function Sidebar({
                 room={r}
                 active={activeId === r.id}
                 avatar={initials(r.name)}
-                onSelect={onSelect}
+                onSelect={pick}
               />
             ))}
           </>
         )}
       </div>
 
-      <div className="flex items-center gap-2 border-t border-[var(--color-line)] px-4 py-3">
+      <div className="flex flex-wrap items-center gap-2 border-t border-[var(--color-line)] px-4 py-3">
         <div className="flex h-8 w-8 items-center justify-center rounded-full bg-[var(--color-fg)] text-xs font-semibold text-[var(--color-bg)]">
           {initials(me.name || me.email)}
         </div>
@@ -218,8 +227,8 @@ export function Sidebar({
           <div className="truncate text-[11px] text-[var(--color-mut)]">{me.email}</div>
         </div>
         <button
-          onClick={onOpenDecisions}
-          className="relative rounded-full border border-[var(--color-line)] px-2.5 py-1 text-xs text-[var(--color-mut)] hover:text-[var(--color-fg)]"
+          onClick={() => nav(onOpenDecisions)}
+          className="relative rounded-full border border-[var(--color-line)] px-2.5 py-2 text-xs text-[var(--color-mut)] hover:text-[var(--color-fg)] md:py-1"
         >
           待办
           {pendingDecisions > 0 && (
@@ -229,32 +238,38 @@ export function Sidebar({
           )}
         </button>
         <button
-          onClick={onOpenMcp}
-          className="rounded-full border border-[var(--color-line)] px-2.5 py-1 text-xs text-[var(--color-mut)] hover:text-[var(--color-fg)]"
+          onClick={() => nav(onOpenTasks)}
+          className="rounded-full border border-[var(--color-line)] px-2.5 py-2 text-xs text-[var(--color-mut)] hover:text-[var(--color-fg)] md:py-1"
+        >
+          任务
+        </button>
+        <button
+          onClick={() => nav(onOpenMcp)}
+          className="rounded-full border border-[var(--color-line)] px-2.5 py-2 text-xs text-[var(--color-mut)] hover:text-[var(--color-fg)] md:py-1"
         >
           MCP
         </button>
         <button
-          onClick={onOpenMemory}
-          className="rounded-full border border-[var(--color-line)] px-2.5 py-1 text-xs text-[var(--color-mut)] hover:text-[var(--color-fg)]"
+          onClick={() => nav(onOpenMemory)}
+          className="rounded-full border border-[var(--color-line)] px-2.5 py-2 text-xs text-[var(--color-mut)] hover:text-[var(--color-fg)] md:py-1"
         >
           记忆
         </button>
         <button
-          onClick={onOpenL2}
-          className="rounded-full border border-[var(--color-line)] px-2.5 py-1 text-xs text-[var(--color-mut)] hover:text-[var(--color-fg)]"
+          onClick={() => nav(onOpenL2)}
+          className="rounded-full border border-[var(--color-line)] px-2.5 py-2 text-xs text-[var(--color-mut)] hover:text-[var(--color-fg)] md:py-1"
         >
           管理
         </button>
         <button
-          onClick={onOpenSettings}
-          className="rounded-full border border-[var(--color-line)] px-2.5 py-1 text-xs text-[var(--color-mut)] hover:text-[var(--color-fg)]"
+          onClick={() => nav(onOpenSettings)}
+          className="rounded-full border border-[var(--color-line)] px-2.5 py-2 text-xs text-[var(--color-mut)] hover:text-[var(--color-fg)] md:py-1"
         >
           设置
         </button>
         <button
-          onClick={onSignOut}
-          className="rounded-full border border-[var(--color-line)] px-2.5 py-1 text-xs text-[var(--color-mut)] hover:text-[var(--color-fg)]"
+          onClick={() => nav(onSignOut)}
+          className="rounded-full border border-[var(--color-line)] px-2.5 py-2 text-xs text-[var(--color-mut)] hover:text-[var(--color-fg)] md:py-1"
         >
           退出
         </button>

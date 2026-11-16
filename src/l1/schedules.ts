@@ -186,7 +186,7 @@ export async function deleteSchedule(db: any, userId: string, id: string) {
 export async function listRuns(db: any, userId: string, scheduleId: string, limit = 20) {
   const n = Math.min(Math.max(Number(limit) || 20, 1), 100);
   const { results } = await db
-    .prepare('SELECT id,status,detail,created_at FROM schedule_runs WHERE schedule_id=? AND user_id=? ORDER BY created_at DESC LIMIT ?')
+    .prepare('SELECT id,status,detail,created_at,attempt,catch_up FROM schedule_runs WHERE schedule_id=? AND user_id=? ORDER BY created_at DESC LIMIT ?')
     .bind(scheduleId, userId, n).all();
   return results ?? [];
 }
@@ -198,13 +198,47 @@ export async function dueSchedules(db: any, nowMs: number) {
   return (results as ScheduleRow[]) || [];
 }
 
-/** 写一条运行记录并更新 last_run_at；返回 runId。 */
-export async function markRun(db: any, a: { scheduleId: string; userId: string; status: string; detail?: string | null }) {
+/** 重试到期（schedule-reliability S2.1）：失败退避后拉回的短窗口 */
+export async function retrySchedules(db: any, nowMs: number) {
+  const { results } = await db
+    .prepare('SELECT * FROM schedules WHERE enabled=1 AND retry_at IS NOT NULL AND retry_at<=? ORDER BY retry_at')
+    .bind(nowMs).all();
+  return (results as ScheduleRow[]) || [];
+}
+
+/** 同窗口最后一行运行记录（重试复用同一记录，audit 可见 attempt） */
+export async function lastRun(db: any, scheduleId: string): Promise<any | null> {
+  const row: any = await db
+    .prepare('SELECT * FROM schedule_runs WHERE schedule_id=? ORDER BY created_at DESC LIMIT 1')
+    .bind(scheduleId).first();
+  return row ?? null;
+}
+
+export async function setRetry(db: any, id: string, retryAtMs: number, attempt: number): Promise<void> {
+  await db.prepare('UPDATE schedules SET retry_at=?, retry_attempt=?, updated_at=? WHERE id=?')
+    .bind(retryAtMs, attempt, now(), id).run().catch(() => null);
+}
+
+export async function clearRetry(db: any, id: string): Promise<void> {
+  await db.prepare('UPDATE schedules SET retry_at=NULL, retry_attempt=0, updated_at=? WHERE id=?')
+    .bind(now(), id).run().catch(() => null);
+}
+
+/**
+ * 写运行记录（schedule-reliability S2.1）：带 windowAt 时同窗口 upsert——重试复用同一行，
+ * created_at 保首跑时刻，attempt 累进，audit 上「一期跑了几次」一目了然。
+ */
+export async function markRun(
+  db: any,
+  a: { scheduleId: string; userId: string; status: string; detail?: string | null; attempt?: number; catchUp?: boolean; windowAt?: number },
+) {
   const t = now();
-  const runId = `sr-${crypto.randomUUID().slice(0, 12)}`;
+  const attempt = Math.max(1, a.attempt ?? 1);
+  const runId = a.windowAt ? `sr-${String(a.scheduleId).replace(/[^a-z0-9]/gi, '').slice(-8)}-${a.windowAt}` : `sr-${crypto.randomUUID().slice(0, 12)}`;
   await db
-    .prepare('INSERT INTO schedule_runs (id,schedule_id,user_id,status,detail,created_at) VALUES (?,?,?,?,?,?)')
-    .bind(runId, a.scheduleId, a.userId, a.status, a.detail ?? null, t).run();
+    .prepare(`INSERT INTO schedule_runs (id,schedule_id,user_id,status,detail,created_at,attempt,catch_up,window_at) VALUES (?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(id) DO UPDATE SET status=excluded.status, detail=excluded.detail, attempt=excluded.attempt`)
+    .bind(runId, a.scheduleId, a.userId, a.status, a.detail ?? null, t, attempt, a.catchUp ? 1 : 0, a.windowAt ?? null).run();
   await db.prepare('UPDATE schedules SET last_run_at=?, updated_at=? WHERE id=? AND user_id=?')
     .bind(t, t, a.scheduleId, a.userId).run();
   return runId;

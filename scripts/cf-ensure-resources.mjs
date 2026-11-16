@@ -45,6 +45,30 @@ for (const v of cfg.vectorize ?? []) {
   console.log(`[ensure] vectorize ${v.index_name}: ${r.ok ? 'created' : (r.out.includes('already') ? 'exists' : 'check-manually')}`);
 }
 
+// 2b) Vectorize 元数据索引（file-knowledge S2.2）：查询过滤只认已建索引的字段，缺则建（REST）。
+// 注意：新建索引**不回填旧向量**（只对之后 upsert 的生效），已有资料需重摄取一遍。
+{
+  const accountId = process.env.CLOUDFLARE_ACCOUNT_ID || cfg.vars?.CLOUDFLARE_ACCOUNT_ID || '';
+  const token = process.env.CLOUDFLARE_API_TOKEN || '';
+  if (accountId && token && (cfg.vectorize ?? []).length) {
+    for (const v of cfg.vectorize ?? []) {
+      for (const prop of ['kind', 'user_id', 'room_id']) {
+        try {
+          const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/vectorize/v2/indexes/${v.index_name}/metadata_index/create`, {
+            method: 'POST',
+            headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+            body: JSON.stringify({ propertyName: prop, indexType: 'string' }),
+          });
+          const j = await res.json().catch(() => null);
+          console.log(`[ensure] metadata_index ${v.index_name}.${prop}: ${j?.success ? 'created' : (res.status === 409 || JSON.stringify(j ?? {}).includes('already') ? 'exists' : `check-manually (${res.status})`)}`);
+        } catch (e) {
+          console.log(`[ensure] metadata_index ${v.index_name}.${prop}: failed (${String(e?.message ?? e).slice(0, 60)})`);
+        }
+      }
+    }
+  }
+}
+
 // 3) Queues：缺则建
 for (const q of [...(cfg.queues?.producers ?? []), ...(cfg.queues?.consumers ?? [])]) {
   if (!q.queue) continue;

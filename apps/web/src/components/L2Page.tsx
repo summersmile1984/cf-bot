@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
-import type { AgentDef, PermRule, Schedule, HarnessInfo, DeviceInfo } from '../lib/api';
+import type { AgentDef, PermRule, Schedule, HarnessInfo, DeviceInfo, ExpertTemplate } from '../lib/api';
 import {
-  listAgentDefs, createAgentDef, updateAgentDef, deleteAgentDef,
+  listAgentDefs, createAgentDef, updateAgentDef, deleteAgentDef, getExpertTemplates, importExpert,
   getPermissions, putPermissions, deletePermission,
   listSchedules, createSchedule, updateSchedule, deleteSchedule, runScheduleNow, listScheduleRuns,
   getHarnessSettings, setHarnessDefault,
@@ -44,8 +44,48 @@ function ExpertsTab() {
   const [defs, setDefs] = useState<AgentDef[]>([]);
   const [editing, setEditing] = useState<Partial<AgentDef> | null>(null);
   const [err, setErr] = useState('');
+  const [templates, setTemplates] = useState<ExpertTemplate[]>([]);
+  const [showTemplates, setShowTemplates] = useState(false);
   const refresh = useCallback(() => listAgentDefs().then(setDefs).catch(() => {}), []);
   useEffect(() => { refresh(); }, [refresh]);
+
+  // Skill 市场（skill-market S2.1/S2.2）：模板目录 / 导入导出
+  const openTemplates = async () => {
+    setShowTemplates((v) => !v);
+    if (!templates.length) {
+      try { setTemplates(await getExpertTemplates()); } catch { setErr('模板加载失败'); }
+    }
+  };
+  const copyTemplate = async (t: ExpertTemplate) => {
+    setErr('');
+    try {
+      await importExpert({ name: t.name, description: t.description, instructions: t.instructions, model: t.model ?? undefined });
+      refresh();
+    } catch (e: any) { setErr(String(e?.message ?? e)); }
+  };
+  const exportDef = (ddef: AgentDef) => {
+    const out = {
+      name: ddef.name, description: ddef.description, instructions: ddef.instructions, model: ddef.model,
+      tools_json: ddef.tools_json, mcp_json: ddef.mcp_json, skills_json: ddef.skills_json, memory_json: ddef.memory_json,
+    };
+    const blob = new Blob([JSON.stringify(out, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `${(ddef.name || 'expert').replace(/[^\w一-鿿-]/g, '_')}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+  const importFile = async (f: File | null) => {
+    if (!f) return;
+    setErr('');
+    try {
+      const parsed = JSON.parse(await f.text());
+      await importExpert(parsed?.expert ?? parsed);
+      refresh();
+    } catch (e: any) {
+      setErr(String(e?.message ?? e).includes('JSON') ? '文件不是合法 JSON' : String(e?.message ?? e));
+    }
+  };
 
   async function save() {
     if (!editing) return;
@@ -63,8 +103,35 @@ function ExpertsTab() {
     <div>
       <div className="mb-3 flex items-center justify-between">
         <p className="text-xs text-[var(--color-mut)]">专家 = 有专长的子代理，可被派发任务；对话工坊适合起草，这里适合精修与治理。</p>
-        <button onClick={() => setEditing({ name: '', description: '', instructions: '' })} className="rounded-full bg-[var(--color-fg)] px-3 py-1.5 text-xs text-[var(--color-bg)]">新建专家</button>
+        <div className="flex items-center gap-2">
+          <button onClick={openTemplates} className={`rounded-full border px-3 py-1.5 text-xs ${showTemplates ? 'border-[var(--color-acc)] text-[var(--color-acc)]' : 'border-[var(--color-line)] text-[var(--color-mut)]'}`}>模板</button>
+          <label className="cursor-pointer rounded-full border border-[var(--color-line)] px-3 py-1.5 text-xs text-[var(--color-mut)] hover:text-[var(--color-fg)]">
+            导入
+            <input type="file" accept=".json,application/json" className="hidden" onChange={(e) => { importFile(e.target.files?.[0] ?? null); e.target.value = ''; }} />
+          </label>
+          <button onClick={() => setEditing({ name: '', description: '', instructions: '' })} className="rounded-full bg-[var(--color-fg)] px-3 py-1.5 text-xs text-[var(--color-bg)]">新建专家</button>
+        </div>
       </div>
+      {showTemplates && (
+        <div className="mb-4 rounded-2xl border border-[var(--color-line)] p-4">
+          <p className="mb-3 text-sm font-medium">精选模板（一键复制到我的专家）</p>
+          <div className="grid gap-2 sm:grid-cols-2">
+            {templates.map((t) => (
+              <div key={t.key} className="rounded-xl border border-[var(--color-line)] p-3">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium">{t.name}</div>
+                    <div className="mt-0.5 text-xs text-[var(--color-mut)]">{t.description}</div>
+                  </div>
+                  <button onClick={() => copyTemplate(t)} className="shrink-0 rounded-full bg-[var(--color-fg)] px-3 py-1 text-xs text-[var(--color-bg)]">复制</button>
+                </div>
+              </div>
+            ))}
+            {!templates.length && <p className="text-xs text-[var(--color-mut)]">模板加载中…</p>}
+          </div>
+        </div>
+      )}
+      {err && <p className="mb-2 text-sm text-red-500">{err}</p>}
       {editing && (
         <div className="mb-4 rounded-2xl border border-[var(--color-line)] p-4">
           <p className="mb-3 text-sm font-medium">{editing.id ? '编辑专家' : '新建专家'}</p>
@@ -95,6 +162,7 @@ function ExpertsTab() {
               <div className="truncate text-xs text-[var(--color-mut)]">{ddef.description || ddef.instructions?.slice(0, 80)}</div>
             </div>
             <button onClick={() => setEditing(ddef)} className="rounded-full border border-[var(--color-line)] px-3 py-1 text-xs text-[var(--color-mut)] hover:text-[var(--color-fg)]">编辑</button>
+            <button onClick={() => exportDef(ddef)} className="rounded-full border border-[var(--color-line)] px-3 py-1 text-xs text-[var(--color-mut)] hover:text-[var(--color-fg)]">导出</button>
             <button onClick={async () => { if (confirm(`删除专家「${ddef.name}」？`)) { await deleteAgentDef(ddef.id); refresh(); } }}
               className="rounded-full border border-[var(--color-line)] px-3 py-1 text-xs text-red-500">删除</button>
           </div>
@@ -164,7 +232,7 @@ function SchedTab() {
   const [items, setItems] = useState<Schedule[]>([]);
   const [editing, setEditing] = useState<Partial<Schedule> | null>(null);
   const [runsFor, setRunsFor] = useState<string | null>(null);
-  const [runs, setRuns] = useState<Array<{ status: string; detail?: string; created_at?: number }>>([]);
+  const [runs, setRuns] = useState<Array<{ status: string; detail?: string; created_at?: number; attempt?: number; catch_up?: number }>>([]);
   const [err, setErr] = useState('');
   const refresh = useCallback(() => listSchedules().then(setItems).catch(() => {}), []);
   useEffect(() => { refresh(); }, [refresh]);
@@ -235,7 +303,9 @@ function SchedTab() {
               <div className="mt-2 space-y-1 rounded-xl bg-[var(--color-bg)] p-2 text-xs">
                 {runs.length ? runs.map((r, i) => (
                   <div key={i} className="flex gap-2">
-                    <span className={r.status === 'success' ? 'text-green-600' : 'text-red-500'}>{r.status}</span>
+                    <span className={r.status === 'success' ? 'text-green-600' : r.status === 'retrying' ? 'text-amber-600' : 'text-red-500'}>{r.status}</span>
+                    {(Number(r.attempt ?? 1) > 1) && <span className="rounded bg-[var(--color-line)] px-1 text-[10px] text-[var(--color-mut)]">第{r.attempt}次</span>}
+                    {Number(r.catch_up ?? 0) === 1 && <span className="rounded bg-[var(--color-line)] px-1 text-[10px] text-[var(--color-mut)]">补跑</span>}
                     <span className="truncate text-[var(--color-mut)]">{r.detail ?? ''}</span>
                   </div>
                 )) : <span className="text-[var(--color-mut)]">暂无运行记录</span>}

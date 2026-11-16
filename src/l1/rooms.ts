@@ -17,7 +17,7 @@ export type RoomEnv = AuthEnv & { DB: any };
 
 /** 可注入的聊天执行器（生产为 Mastra orchestrator，测试用假实现）。 */
 export type ChatRunner = {
-  stream: (messages: any[], opts: any) => Promise<{ textStream: ReadableStream<string> }>;
+  stream: (messages: any[], opts: any) => Promise<{ textStream: ReadableStream<string>; modelId?: Promise<string | null> }>;
 };
 
 export type RoomDeps = {
@@ -206,7 +206,7 @@ async function listMessages(c: any, E: RoomEnv) {
     afterTs = row ? Number(row.created_at) : 0;
   }
   const { results } = await E.DB.prepare(
-    `SELECT id, user_id, role, content, created_at FROM messages WHERE room_id=? AND created_at>? ORDER BY created_at ASC LIMIT 200`,
+    `SELECT id, user_id, role, content, model, created_at FROM messages WHERE room_id=? AND created_at>? ORDER BY created_at ASC LIMIT 200`,
   )
     .bind(roomId, afterTs)
     .all();
@@ -337,19 +337,21 @@ async function sendMessage(c: any, E: RoomEnv, chat: ChatRunner, notifyRoom?: Ro
 
   const persistAssistant = async (full: string): Promise<string | void> => {
     const content = full.trim() || '（空回复）';
+    // 本轮服务模型（模型选择 T3）：落 messages.model，UI 显示模型章
+    const modelId = await Promise.resolve((out as any)?.modelId).catch(() => null) || null;
     if (layering) {
       const { main, detail } = splitLayeredReply(content, layering.topicName);
       // 详情入卷（工作现场）
       const detailId = rid('msg');
-      await E.DB.prepare('INSERT INTO messages (id,room_id,user_id,role,content,created_at) VALUES (?,?,?,?,?,?)')
-        .bind(detailId, layering.topicId, null, 'assistant', detail, now())
+      await E.DB.prepare('INSERT INTO messages (id,room_id,user_id,role,content,model,created_at) VALUES (?,?,?,?,?,?,?)')
+        .bind(detailId, layering.topicId, null, 'assistant', detail, modelId, now())
         .run();
       await E.DB.prepare('UPDATE rooms SET updated_at=? WHERE id=?').bind(now(), layering.topicId).run();
       try { await notifyRoom?.(layering.topicId, { kind: 'message', messageId: detailId }); } catch {}
       // 结论 + 指路回主会话（发消息的房间）；主题只留未读点，不刷屏
       const mainId = rid('msg');
-      await E.DB.prepare('INSERT INTO messages (id,room_id,user_id,role,content,created_at) VALUES (?,?,?,?,?,?)')
-        .bind(mainId, roomId, null, 'assistant', main, now())
+      await E.DB.prepare('INSERT INTO messages (id,room_id,user_id,role,content,model,created_at) VALUES (?,?,?,?,?,?,?)')
+        .bind(mainId, roomId, null, 'assistant', main, modelId, now())
         .run();
       await E.DB.prepare('UPDATE rooms SET updated_at=? WHERE id=?').bind(now(), roomId).run();
       await touchRead(E.DB, roomId, user.id);
@@ -357,8 +359,8 @@ async function sendMessage(c: any, E: RoomEnv, chat: ChatRunner, notifyRoom?: Ro
       return main;
     }
     const asstId = rid('msg');
-    await E.DB.prepare('INSERT INTO messages (id,room_id,user_id,role,content,created_at) VALUES (?,?,?,?,?,?)')
-      .bind(asstId, roomId, null, 'assistant', content, now())
+    await E.DB.prepare('INSERT INTO messages (id,room_id,user_id,role,content,model,created_at) VALUES (?,?,?,?,?,?,?)')
+      .bind(asstId, roomId, null, 'assistant', content, modelId, now())
       .run();
     await E.DB.prepare('UPDATE rooms SET updated_at=? WHERE id=?').bind(now(), roomId).run();
     await touchRead(E.DB, roomId, user.id);

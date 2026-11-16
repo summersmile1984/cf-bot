@@ -7,6 +7,10 @@ import {
   updateOmObservation,
   deleteOmObservation,
   exportOmDownload,
+  getFiles,
+  uploadFile,
+  deleteFile,
+  type UserFile,
 } from '../lib/api';
 
 function fmt(ts?: number | null) {
@@ -50,7 +54,24 @@ function SupersededFold({ records, onOpen }: { records: OmRecord[]; onOpen?: (r:
 }
 
 export function MemoryPage() {
-  const [tab, setTab] = useState<'profile' | 'log' | 'export'>('profile');
+  const [tab, setTab] = useState<'profile' | 'log' | 'files' | 'export'>('profile');
+  // 资料（file-knowledge S2.1）：上传/列表/删除
+  const [files, setFiles] = useState<UserFile[]>([]);
+  const [fileMsg, setFileMsg] = useState('');
+  const refreshFiles = useCallback(async () => {
+    try { setFiles(await getFiles()); } catch { /* 静默 */ }
+  }, []);
+  useEffect(() => { if (tab === 'files') refreshFiles(); }, [tab, refreshFiles]);
+  const onPickFile = async (f: File | null) => {
+    if (!f) return;
+    setFileMsg('上传中…');
+    try {
+      const content = await f.text();
+      const r = await uploadFile({ name: f.name, content });
+      setFileMsg(r.ok ? '已上传，正在建立索引…' : String(r.error ?? '上传失败'));
+      await refreshFiles();
+    } catch { setFileMsg('上传失败'); }
+  };
   const [overview, setOverview] = useState<OmOverview | null>(null);
   const [rooms, setRooms] = useState<{ thread: string; records: OmRecord[] }[]>([]);
   const [err, setErr] = useState<string | null>(null);
@@ -135,10 +156,10 @@ export function MemoryPage() {
 
   return (
     <div className="flex h-full flex-col">
-      <div className="flex items-center gap-3 border-b border-[var(--color-line)] px-6 py-4">
+      <div className="flex items-center gap-3 border-b border-[var(--color-line)] px-4 md:px-6 py-4">
         <h2 className="text-[17px] font-semibold">记忆</h2>
         <div className="flex rounded-full border border-[var(--color-line)] text-sm">
-          {([['profile', '主人画像'], ['log', '观测日志'], ['export', '导出']] as const).map(([t, label]) => (
+          {([['profile', '主人画像'], ['log', '观测日志'], ['files', '资料'], ['export', '导出']] as const).map(([t, label]) => (
             <button
               key={t}
               onClick={() => setTab(t)}
@@ -169,7 +190,7 @@ export function MemoryPage() {
       )}
 
       {tab === 'profile' && (
-        <div className="thin-scroll flex-1 overflow-y-auto px-6 py-5">
+        <div className="thin-scroll flex-1 overflow-y-auto px-4 md:px-6 py-5">
           {!editMode ? (
             <div className="max-w-2xl">
               {profile && (profile.name || profile.preferredName || profile.timezone || (profile.facts ?? []).length) ? (
@@ -226,7 +247,7 @@ export function MemoryPage() {
       )}
 
       {tab === 'log' && (
-        <div className="thin-scroll flex-1 overflow-y-auto px-6 py-4">
+        <div className="thin-scroll flex-1 overflow-y-auto px-4 md:px-6 py-4">
           {rooms.filter((g) => !roomFilter || g.thread === roomFilter).map((g) => {
             const meta = overview?.rooms.find((r) => r.thread === g.thread);
             return (
@@ -257,8 +278,49 @@ export function MemoryPage() {
         </div>
       )}
 
+      {tab === 'files' && (
+        <div className="thin-scroll flex-1 overflow-y-auto px-4 md:px-6 py-6">
+          <div className="mb-4 max-w-xl rounded-2xl border border-[var(--color-line)] bg-[var(--color-side)] p-5">
+            <h3 className="text-sm font-semibold">上传资料</h3>
+            <p className="mt-1 text-xs text-[var(--color-mut)]">
+              文本档（txt/md/csv/json/log）≤512KB。上传后自动切块建立索引，聊天问到相关内容时秘书会引用并标注 [file:文件名]。
+            </p>
+            <label className="mt-3 inline-block cursor-pointer rounded-full bg-[var(--color-fg)] px-4 py-2 text-xs font-medium text-[var(--color-bg)]">
+              选择文件
+              <input
+                type="file"
+                accept=".txt,.md,.csv,.json,.log,text/plain"
+                className="hidden"
+                onChange={(e) => { onPickFile(e.target.files?.[0] ?? null); e.target.value = ''; }}
+              />
+            </label>
+            {fileMsg && <p className="mt-2 text-xs text-[var(--color-acc)]">{fileMsg}</p>}
+          </div>
+          {files.length === 0 && <p className="py-8 text-center text-sm text-[var(--color-mut)]">还没有资料</p>}
+          {files.map((f) => (
+            <div key={f.id} className="mb-2 flex items-center gap-3 rounded-xl border border-[var(--color-line)] px-4 py-3">
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-sm">{f.name}</div>
+                <div className="text-[11px] text-[var(--color-mut)]">
+                  {f.kind} · {(f.size / 1024).toFixed(1)}KB · {f.status === 'indexed' ? '已索引' : f.status === 'failed' ? '索引失败' : '索引中…'}
+                </div>
+              </div>
+              <button
+                onClick={async () => {
+                  if (!window.confirm(`删除资料「${f.name}」？（不可恢复）`)) return;
+                  try { await deleteFile(f.id); await refreshFiles(); } catch { /* 静默 */ }
+                }}
+                className="shrink-0 rounded-full border border-[var(--color-line)] px-3 py-1 text-xs text-[var(--color-mut)] hover:text-red-500"
+              >
+                删除
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
       {tab === 'export' && (
-        <div className="flex-1 px-6 py-8">
+        <div className="flex-1 px-4 md:px-6 py-8">
           <div className="max-w-md rounded-2xl border border-[var(--color-line)] bg-[var(--color-side)] p-5">
             <h3 className="text-sm font-semibold">导出记忆存档</h3>
             <p className="mt-2 text-xs leading-5 text-[var(--color-mut)]">

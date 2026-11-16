@@ -53,7 +53,9 @@ import { ensureVaultTable, createVaultEntry, createOAuthCredential, listVaultEnt
 import { ensureNotificationTables, notifyUser, listNotifications, unreadCount, markNotificationsRead, getEmailPrefs, patchEmailPrefs } from './notifications';
 import { ensureDecisionTables, createDecision, answerDecision, declineDecision, answerDecisionForTask, cancelDecisionsForTask, expireDueDecisions, listDecisions, pendingCount } from './decisions';
 import { savePushSubscription, removePushSubscription } from './push';
+import { permissionClassifier, createModelSelection } from './decision';
 import { agentMetadata, agentJwks } from './pap';
+import { saveFile, ingestFile, deleteFile, listFiles, searchFiles } from './files';
 import { ensureAgentDefs, listExperts, resolveExpert, createExpert, updateExpert, deleteExpert, expertOut, validateExpertDef } from './experts';
 import harnessesJson from '../l2/harnesses.json';
 import mcpCatalogJson from '../l2/mcp-catalog.json';
@@ -62,9 +64,11 @@ import { ensureMcpTables, connOut, listConnections, deleteConnection, upsertConn
 import {
   listSchedules, getSchedule, createSchedule, updateSchedule, deleteSchedule,
   listRuns, dueSchedules, markRun, advanceSchedule, computeNextRunAt,
+  retrySchedules, lastRun, setRetry, clearRetry,
 } from '../l1/schedules';
 // provider-registry 的 package exports 不放行子路径——相对路径导入让打包器内联（运行时无解析）
 import providerRegistry from '../../node_modules/@mastra/core/dist/provider-registry.json';
+import expertTemplatesJson from './expert-templates.json';
 
 const E = env as any;
 const L2_AGENT_ID = 'l2-worker';
@@ -111,6 +115,7 @@ function db() {
     .then(() => d.prepare('ALTER TABLE user_settings ADD COLUMN harness TEXT').run().catch(() => null))
     .then(() => d.prepare('ALTER TABLE user_settings ADD COLUMN oauth_clients TEXT').run().catch(() => null))
     .then(() => d.prepare('ALTER TABLE user_settings ADD COLUMN notification_prefs TEXT').run().catch(() => null))
+    .then(() => d.prepare('ALTER TABLE messages ADD COLUMN model TEXT').run().catch(() => null))
     .then(() => d.prepare('CREATE TABLE IF NOT EXISTS device_defaults (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER NOT NULL)').run())
     .then(() => d.prepare(`CREATE TABLE IF NOT EXISTS schedules (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, cron TEXT NOT NULL,
@@ -121,6 +126,11 @@ function db() {
     .then(() => d.prepare(`CREATE TABLE IF NOT EXISTS schedule_runs (
       id TEXT PRIMARY KEY, schedule_id TEXT NOT NULL, user_id TEXT NOT NULL,
       status TEXT NOT NULL, detail TEXT, created_at INTEGER NOT NULL)`).run())
+    .then(() => d.prepare('ALTER TABLE schedule_runs ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1').run().catch(() => null))
+    .then(() => d.prepare('ALTER TABLE schedule_runs ADD COLUMN catch_up INTEGER NOT NULL DEFAULT 0').run().catch(() => null))
+    .then(() => d.prepare('ALTER TABLE schedule_runs ADD COLUMN window_at INTEGER').run().catch(() => null))
+    .then(() => d.prepare('ALTER TABLE schedules ADD COLUMN retry_at INTEGER').run().catch(() => null))
+    .then(() => d.prepare('ALTER TABLE schedules ADD COLUMN retry_attempt INTEGER NOT NULL DEFAULT 0').run().catch(() => null))
     .then(() => d.prepare('CREATE INDEX IF NOT EXISTS schedules_due ON schedules(enabled, next_run_at)').run())
     .then(() => d.prepare('CREATE INDEX IF NOT EXISTS schedules_user ON schedules(user_id, enabled)').run())
     .then(() => d.prepare('CREATE INDEX IF NOT EXISTS schedule_runs_sched ON schedule_runs(schedule_id, created_at)').run())
@@ -785,6 +795,9 @@ const orchestrator = new Agent({
     const p = await getPersona(E.DB);
     return { reasoning: p.model_effort } as any;
   },
+  // 模型选择（clef-decisions T3）：Mastra ModelSelectionProcessor——trivial 高置信降级便宜档，
+  // 其余弃权走上面的 persona 默认模型（只降不升，用户配置不被覆盖）
+  inputProcessors: [createModelSelection(E)],
   tools: { dispatch_to_sandbox, dispatch_to_expert: dispatch_expert_tool, list_experts: list_experts_tool, draft_expert: draft_expert_tool, save_expert: save_expert_tool, create_schedule: create_schedule_tool, list_schedules: list_schedules_tool, delete_schedule: delete_schedule_tool, open_topic: open_topic_tool, close_topic: close_topic_tool, job_status: job_status_tool, cancel_job: cancel_job_tool, follow_up_job: follow_up_job_tool, publish_page: publish_page_tool },
   memory: memoryRef,
 });
@@ -1252,6 +1265,50 @@ export const mastra = new Mastra({
           await ready;
           try {
             const r = await createExpert(d, String(u.id), body);
+            return (r as any).error ? c.json({ error: (r as any).error }, 400) : c.json({ expert: expertOut(r) }, 201);
+          } catch (e: any) {
+            return c.json({ error: String(e?.message ?? e).slice(0, 160) }, 400);
+          }
+        },
+      } as any),
+      // Skill 市场（skill-market S2.1）：精选模板目录
+      registerApiRoute('/agent-defs/templates', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          return c.json({ templates: (expertTemplatesJson as any).templates ?? [] });
+        },
+      } as any),
+      // Skill 市场（skill-market S2.2）：导入专家 JSON（白名单字段 + 同名改名）
+      registerApiRoute('/agent-defs/import', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const pick = body?.expert ?? body ?? {};
+          const clean: any = {};
+          for (const k of ['name', 'description', 'instructions', 'model', 'tools_json', 'mcp_json', 'skills_json', 'memory_json']) {
+            if (pick[k] !== undefined && pick[k] !== null) clean[k] = typeof pick[k] === 'string' ? pick[k] : JSON.stringify(pick[k]);
+          }
+          if (!String(clean.name ?? '').trim() || !String(clean.instructions ?? '').trim()) {
+            return c.json({ error: 'bad payload：需要 name 与 instructions' }, 400);
+          }
+          const { d, ready } = db();
+          await ready;
+          try {
+            // 同名自动改名 xxx(2)（skill-market S2.2）
+            let name = String(clean.name).trim().slice(0, 100);
+            for (let i = 2; i <= 20; i++) {
+              const dupName: any = await d.prepare('SELECT 1 AS x FROM agent_defs WHERE owner_user_id=? AND name=?').bind(String(u.id), name).first();
+              if (!dupName) break;
+              name = `${String(clean.name).trim().slice(0, 90)}(${i})`;
+            }
+            clean.name = name;
+            const r = await createExpert(d, String(u.id), clean);
             return (r as any).error ? c.json({ error: (r as any).error }, 400) : c.json({ expert: expertOut(r) }, 201);
           } catch (e: any) {
             return c.json({ error: String(e?.message ?? e).slice(0, 160) }, 400);
@@ -1979,6 +2036,32 @@ export const mastra = new Mastra({
             return c.json({ error: 'question already pending' }, 409);
           }
           const clean = sanitizeProgress(question);
+          // 条件放行（clef-decisions S2.2）：permission_ask 低风险高置信自动放行（留痕+通知）；
+          // 不确定/模型异常一律回落真审批（fail-closed 基线不变）
+          {
+            const autoOwner = String(task.owner_id ?? auth.userId ?? '');
+            if (autoOwner && String(body?.kind ?? '') === 'permission_ask') {
+              try {
+                const { answers } = await permissionClassifier(E).decide({
+                  state: { question: clean, task: String(task.prompt ?? '').slice(0, 400) },
+                });
+                const a: any = answers.low_risk;
+                if (a?.type === 'boolean' && a.probability >= 0.9) {
+                  await d.prepare('UPDATE l2_tasks SET ask_answer=? WHERE task_id=? AND ask_answer IS NULL')
+                    .bind('允许（自动放行：Clef 判定低风险）', taskId).run();
+                  const dec = await createDecision(d, { userId: autoOwner, kind: 'permission_ask', refId: taskId, roomId: task.thread_id, question: clean });
+                  await answerDecision(d, autoOwner, dec.id, `自动放行（Clef 判定低风险 p=${a.probability.toFixed(2)}）`);
+                  await notifyUser(d, {
+                    userId: autoOwner, kind: 'decision.answered',
+                    title: `已自动放行：${clean.slice(0, 40)}`,
+                    body: `Clef 判定低风险（p=${a.probability.toFixed(2)}），无需拍板；记录在待办可查。`,
+                    link: 'decisions', refType: 'decision', refId: dec.id,
+                  }, E);
+                  return c.json({ ok: true, autoApproved: true });
+                }
+              } catch (e: any) { console.log('[decision] approval classify failed', String(e?.message ?? e).slice(0, 120)); }
+            }
+          }
           // 审批中心（approvals-hub S2.1）：决策请求落库 + 通知（task_ask / permission_ask 同通道，body.kind 区分）
           try {
             const owner = String(task.owner_id ?? auth.userId ?? '');
@@ -2231,6 +2314,128 @@ export const mastra = new Mastra({
           return c.json({ ok: true });
         },
       } as any),
+      // 任务历史（task-history S2.1）：跨房间任务时间线聚合，owner 置顶过滤
+      registerApiRoute('/tasks', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db(); await ready;
+          const status = String(c.req.query('status') ?? '').trim();
+          const device = String(c.req.query('device') ?? '').trim();
+          const room = String(c.req.query('room') ?? '').trim();
+          const limit = Math.min(100, Math.max(1, Number(c.req.query('limit') ?? 50)));
+          let sql = `SELECT t.task_id, t.prompt, t.kind, t.state, t.runtime, t.thread_id, t.device_id, t.created_at, t.updated_at,
+              r.name AS room_name, dv.name AS device_name,
+              (SELECT COUNT(*) FROM task_artifacts a WHERE a.task_id = t.task_id) AS artifacts,
+              (SELECT x.status FROM decisions x WHERE x.ref_id = t.task_id ORDER BY x.created_at DESC LIMIT 1) AS decision_status
+            FROM l2_tasks t
+            LEFT JOIN rooms r ON r.id = t.thread_id
+            LEFT JOIN devices dv ON dv.id = t.device_id
+            WHERE t.owner_id = ?`;
+          const binds: any[] = [String(u.id)];
+          if (status) {
+            const set = status === 'terminal' ? ['completed', 'failed', 'canceled', 'rejected'] : status === 'active' ? ['queued', 'working'] : [status];
+            sql += ` AND t.state IN (${set.map(() => '?').join(',')})`;
+            binds.push(...set);
+          }
+          if (device) { sql += ' AND t.device_id = ?'; binds.push(device); }
+          if (room) { sql += ' AND t.thread_id = ?'; binds.push(room); }
+          sql += ' ORDER BY t.created_at DESC LIMIT ?';
+          binds.push(limit);
+          const { results: rows } = await d.prepare(sql).bind(...binds).all();
+          // 耗点流水（含退补）：一次取齐，避免 N+1
+          const ids = (rows ?? []).map((x: any) => String(x.task_id));
+          const ledger: Record<string, number> = {};
+          if (ids.length) {
+            const keys = ids.flatMap((id) => [`task:${id}`, `refund:task:${id}`]);
+            const { results: ls } = await d
+              .prepare(`SELECT idempotency_key, entry, units FROM usage_ledger WHERE user_id=? AND idempotency_key IN (${keys.map(() => '?').join(',')})`)
+              .bind(String(u.id), ...keys).all();
+            for (const l of ls ?? []) {
+              const k = String(l.idempotency_key).replace(/^refund:/, '');
+              ledger[k] = (ledger[k] ?? 0) + (String(l.entry) === 'refund' ? -Number(l.units) : Number(l.units));
+            }
+          }
+          return c.json({
+            items: (rows ?? []).map((x: any) => ({
+              taskId: x.task_id, prompt: String(x.prompt ?? '').slice(0, 80), kind: x.kind ?? 'sandbox', status: x.state,
+              runtime: x.runtime, roomId: x.thread_id, roomName: x.room_name ?? null,
+              deviceId: x.device_id ?? null, deviceName: x.device_name ?? null,
+              createdAt: x.created_at, updatedAt: x.updated_at,
+              quotaPoints: ledger[`task:${x.task_id}`] ?? 0,
+              artifacts: Number(x.artifacts ?? 0), decision: x.decision_status ?? null,
+              link: `room:${x.thread_id}`,
+            })),
+          });
+        },
+      } as any),
+      registerApiRoute('/tasks/:id', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db(); await ready;
+          const id = String(c.req.param('id') ?? '');
+          const t: any = await d.prepare('SELECT * FROM l2_tasks WHERE task_id=? AND owner_id=?').bind(id, String(u.id)).first();
+          if (!t) return c.json({ error: 'not found' }, 404);
+          const arts = (await d.prepare('SELECT id, kind, caption FROM task_artifacts WHERE task_id=? ORDER BY created_at').bind(id).all()).results ?? [];
+          const decs = (await d.prepare('SELECT id, kind, status, question, answer, created_at, decided_at FROM decisions WHERE ref_id=? ORDER BY created_at').bind(id).all()).results ?? [];
+          const { results: led } = await d
+            .prepare(`SELECT idempotency_key, entry, units, detail, created_at FROM usage_ledger
+              WHERE user_id=? AND (idempotency_key=? OR idempotency_key=?) ORDER BY created_at`)
+            .bind(String(u.id), `task:${id}`, `refund:task:${id}`).all();
+          return c.json({
+            task: {
+              taskId: t.task_id, prompt: t.prompt ?? '', kind: t.kind ?? 'sandbox', status: t.state, runtime: t.runtime,
+              roomId: t.thread_id, deviceId: t.device_id ?? null, createdAt: t.created_at, updatedAt: t.updated_at,
+              progress: (() => { try { return t.progress ? JSON.parse(t.progress) : []; } catch { return []; } })(),
+              result: t.result ?? null,
+            },
+            artifacts: arts,
+            decisions: decs,
+            ledger: led ?? [],
+          });
+        },
+      } as any),
+      // 资料/知识库（file-knowledge S2.1）：上传（异步摄取）/ 列表 / 删除
+      registerApiRoute('/files', {
+        method: 'POST',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const body: any = await c.req.json().catch(() => ({}));
+          const { d, ready } = db(); await ready;
+          const r = await saveFile(d, { userId: String(u.id), name: body?.name, content: body?.content, kind: body?.kind, roomId: body?.roomId ?? null });
+          if (!r.ok) return c.json({ error: r.reason }, 400);
+          try { c.executionCtx.waitUntil(ingestFile(E, d, r.id)); } catch { await ingestFile(E, d, r.id); }
+          return c.json({ ok: true, id: r.id }, 201);
+        },
+      } as any),
+      registerApiRoute('/files', {
+        method: 'GET',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db(); await ready;
+          return c.json({ files: await listFiles(d, String(u.id)) });
+        },
+      } as any),
+      registerApiRoute('/files/:id', {
+        method: 'DELETE',
+        requiresAuth: false,
+        handler: async (c: any) => {
+          const u = await getSessionUser(c.req.raw ?? { headers: c.req.headers }, E as any);
+          if (!u) return c.json({ error: 'unauthorized' }, 401);
+          const { d, ready } = db(); await ready;
+          const ok = await deleteFile(E, d, String(u.id), String(c.req.param('id') ?? ''));
+          return ok ? c.json({ ok: true }) : c.json({ error: 'not found' }, 404);
+        },
+      } as any),
       // 订阅与收款（saas S2.5）：Paddle webhook / 结账 / 订阅查询
       registerApiRoute('/webhooks/paddle', {
         method: 'POST',
@@ -2360,7 +2565,27 @@ export const mastra = new Mastra({
             ensureOmInstalled();
             await syncEngineCopy();
             // 提示词装配（S2.3）：基座+身份走 Agent.instructions；语调+画像走消息级 system 前置。
-            const msgs = await withThreadBlock(messages as any[], String((opts as any)?.memory?.thread ?? '') || undefined);
+            const baseMsgs = await withThreadBlock(messages as any[], String((opts as any)?.memory?.thread ?? '') || undefined);
+            // 资料检索（file-knowledge S2.3）：命中资料块时注入上下文（回答按约定 [file:文件名] 标注）
+            let msgs = baseMsgs;
+            try {
+              const fThread = String((opts as any)?.memory?.thread ?? '');
+              const lu = [...(messages as any[])].reverse().find((m: any) => (m?.role ?? m?.content?.role) === 'user');
+              const q = String((lu as any)?.content ?? (lu as any)?.text ?? '').replace(/^【[^】]*】\s*/, '').trim();
+              if (q && fThread) {
+                const { d: fd, ready: fr } = db(); await fr;
+                const own: any = await fd.prepare('SELECT created_by FROM rooms WHERE id=?').bind(fThread).first();
+                const fOwner = String(own?.created_by ?? '');
+                if (fOwner) {
+                  const hits = await searchFiles(E, fd, fOwner, q, fThread);
+                  if (hits.length) {
+                    const block = '【用户资料片段】回答相关时可引用并用 [file:文件名] 标注来源：\n'
+                      + hits.map((h) => `— ${h.name}：${h.content}`).join('\n');
+                    msgs = [{ role: 'system', content: block } as any, ...baseMsgs];
+                  }
+                }
+              }
+            } catch (e: any) { console.log('[files] recall failed', String(e?.message ?? e).slice(0, 120)); }
             const out = await orchestrator.stream(msgs, opts as any);
             // OM 周期走队列（S2.8）：流结束只入队，queue consumer 独立 invocation 跑 Observer/Reflector。
             // （fire-and-forget 在 Workers 会随响应结束被回收，实测观测永不落库。）
@@ -2378,7 +2603,26 @@ export const mastra = new Mastra({
                 } catch {}
               },
             }));
-            return { textStream: wrapped };
+            return {
+              textStream: wrapped,
+              // 本轮实际服务模型（模型选择 T3）：response.modelId 优先，缺失回落 steps；落库供 UI 模型章
+              modelId: (async () => {
+                try {
+                  const r: any = await (out as any)?.response;
+                  console.log('[model-picked] resp', JSON.stringify({ hasResp: !!r, modelId: r?.modelId ?? null, keys: r ? Object.keys(r).slice(0, 8) : [] }));
+                  if (r?.modelId) return String(r.modelId);
+                  const steps: any[] = ((await (out as any)?.steps) ?? []) as any[];
+                  for (let i = steps.length - 1; i >= 0; i--) {
+                    const m = steps[i]?.response?.modelId ?? steps[i]?.request?.model ?? steps[i]?.modelId;
+                    if (m) return String(m);
+                  }
+                  return null;
+                } catch (e: any) {
+                  console.log('[model-picked] err', String(e?.message ?? e).slice(0, 100));
+                  return null;
+                }
+              })(),
+            };
           },
         },
         // 闹钟语义：唤醒对应房间的 RoomDO，推送内容由 DO 读 D1（S2.3）
@@ -2498,17 +2742,35 @@ const schedulesTick = async () => {
       }
     } catch (e: any) { console.log('[decision] expire failed', String(e?.message ?? e).slice(0, 120)); }
     const due = await dueSchedules(d, Date.now());
-    for (const rec of due as any[]) {
+    const retryDue = await retrySchedules(d, Date.now());
+    const work = [
+      ...(due as any[]).map((rec) => ({ rec, mode: 'normal' as const })),
+      ...(retryDue as any[]).map((rec) => ({ rec, mode: 'retry' as const })),
+    ];
+    for (const { rec, mode } of work) {
+      const nowMs = Date.now();
+      // 同窗口语义（schedule-reliability S2.1）：windowAt=本期 cron 点，重试复用同一 run 记录与同一计量幂等键
+      let windowAt = Number(rec.next_run_at ?? nowMs);
+      let attempt = 1;
+      const catchUp = mode === 'normal' && windowAt < nowMs - 10 * 60_000;
       try {
-        // claim：先原子推走 next_run_at（防止慢回合 + 下一 tick 双发）
-        const claimed = await d.prepare('UPDATE schedules SET next_run_at=? WHERE id=? AND next_run_at=?')
-          .bind((await computeNextRunAtSafe(rec, Date.now())), rec.id, rec.next_run_at).run();
-        if (!claimed?.meta?.changes) continue;
-        try { await advanceSchedule(d, rec.id, Date.now()); } catch {}
+        if (mode === 'retry') {
+          const last = await lastRun(d, rec.id);
+          windowAt = Number(last?.window_at ?? windowAt);
+          attempt = Number(last?.attempt ?? 1) + 1;
+          await clearRetry(d, rec.id);
+          if (attempt > 3) continue; // 判死：不再重试，等下个正常周期
+        } else {
+          // claim：先原子推走 next_run_at（防止慢回合 + 下一 tick 双发）
+          const claimed = await d.prepare('UPDATE schedules SET next_run_at=?, retry_at=NULL, retry_attempt=0 WHERE id=? AND next_run_at=?')
+            .bind((await computeNextRunAtSafe(rec, nowMs)), rec.id, rec.next_run_at).run();
+          if (!claimed?.meta?.changes) continue;
+          try { await advanceSchedule(d, rec.id, nowMs); } catch {}
+        }
         // 计量点①补口（计费绕过修复）：例程触发的 L1 回合同价计费（allowOverage 记账不拦截，对齐「主会话不硬锁死」）
         if (rec.user_id) {
           try {
-            await chargeQuota(d, String(rec.user_id), { kind: 'pool', units: 1, idempotencyKey: `turn:sched:${rec.id}:${rec.next_run_at}`, detail: '定时例程回合', allowOverage: true });
+            await chargeQuota(d, String(rec.user_id), { kind: 'pool', units: 1, idempotencyKey: `turn:sched:${rec.id}:${windowAt}`, detail: '定时例程回合', allowOverage: true });
           } catch (e: any) { console.log('[quota] sched charge failed', String(e?.message ?? e).slice(0, 120)); }
         }
         const threadId = String(rec.target_id ?? '');
@@ -2523,13 +2785,21 @@ const schedulesTick = async () => {
         const msgId = `msg-${crypto.randomUUID()}`;
         await d.prepare('INSERT INTO messages (id,room_id,user_id,role,content,created_at) VALUES (?,?,?,?,?,?)')
           .bind(msgId, threadId, null, 'assistant', content, Date.now()).run();
-        await d.prepare('UPDATE rooms SET updated_at=? WHERE id=?').bind(Date.now(), threadId).run();
+        await d.prepare('UPDATE schedules SET updated_at=? WHERE id=?').bind(Date.now(), threadId).run();
         try { await notifyRoom(threadId, { kind: 'message', messageId: msgId }); } catch {}
-        await markRun(d, { scheduleId: rec.id, userId: rec.user_id, status: 'success', detail: content.slice(0, 200) });
+        await markRun(d, { scheduleId: rec.id, userId: rec.user_id, status: 'success', detail: content.slice(0, 200), attempt, catchUp, windowAt });
       } catch (e: any) {
-        try { await markRun(d, { scheduleId: rec.id, userId: rec.user_id, status: 'failed', detail: String(e?.message ?? e).slice(0, 200) }); } catch {}
+        // 失败重试（schedule-reliability S2.1）：≤2 次退避（1/5 分钟），第 3 次判死；同窗口同记录
+        try {
+          const canRetry = attempt < 3;
+          await markRun(d, {
+            scheduleId: rec.id, userId: rec.user_id, status: canRetry ? 'retrying' : 'failed',
+            detail: String(e?.message ?? e).slice(0, 200), attempt, catchUp, windowAt,
+          });
+          if (canRetry) await setRetry(d, rec.id, Date.now() + (attempt === 1 ? 60_000 : 300_000), attempt);
+          else await clearRetry(d, rec.id);
+        } catch {}
       }
-      try { await advanceSchedule(d, rec.id, Date.now()); } catch {}
     }
   } catch (e: any) {
     console.log('[schedules] tick failed', String(e?.message ?? e).slice(0, 160));
